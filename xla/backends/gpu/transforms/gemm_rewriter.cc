@@ -919,7 +919,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                         lhs_ragged_dim_hrd) > 0;
 
       // Sequential-dim tile sizes stored on the inner ragged_dot.
-      Tile inner_tile_config;
+      xtile::Tile inner_tile_config;
       if (is_batch_hrd) {
         // kRaggedBatch: batched GEMM [B,M,K]×[B,K,N]→[B,M,N].
         // Sequential dims: K (inner contraction).
@@ -982,7 +982,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
       FusionBackendConfig* fusion_config =
           gpu_backend_config.mutable_fusion_backend_config();
       fusion_config->set_kind(std::string(kTritonGemmFusionKind));
-      BlockLevelFusionConfig* blk_cfg =
+      xtile::BlockLevelFusionConfig* blk_cfg =
           fusion_config->mutable_block_level_fusion_config();
 
       auto* output_tile = blk_cfg->add_output_tiles();
