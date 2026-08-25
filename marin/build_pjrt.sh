@@ -20,7 +20,7 @@ set -euo pipefail
 XLA_SOURCE="${XLA_SOURCE:?set XLA_SOURCE (path to this XLA checkout)}"
 JAX_COMMIT="${JAX_COMMIT:?set JAX_COMMIT (jax revision to build against)}"
 JAX_WHEEL_BUILD_DATE="${JAX_WHEEL_BUILD_DATE:?set JAX_WHEEL_BUILD_DATE (YYYYMMDD of the sibling nightly)}"
-MARIN_XLA_COMMIT="${MARIN_XLA_COMMIT:?set MARIN_XLA_COMMIT (this fork's tip)}"
+MARIN_XLA_COMMIT="${MARIN_XLA_COMMIT:?set MARIN_XLA_COMMIT (the fork tip being built)}"
 OUT_DIR="${OUT_DIR:?set OUT_DIR}"
 CUDA_COMPUTE_CAPABILITIES="${CUDA_COMPUTE_CAPABILITIES:-sm_100}"
 BAZEL_JOBS="${BAZEL_JOBS:-4}"

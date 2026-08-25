@@ -61,6 +61,10 @@ jobs:
           UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
           echo "upstream base: ${UPSTREAM_BASE}"
 
+          # The build script is only read after the toolchain and cache steps, so a syntax error
+          # in it otherwise surfaces minutes in. Parse it here instead.
+          bash -n marin/build_pjrt.sh
+
           python marin/release/pjrt_release.py \
             --config "$RELEASE_CONFIG" \
             --fork-commit "$GITHUB_SHA" \
