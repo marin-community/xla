@@ -249,7 +249,10 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     int64_t cta_count, int64_t input_buffer_offset_bytes,
     int64_t output_buffer_offset_bytes) {
   se::StreamExecutor* executor = stream->parent();
-  static constexpr size_t kThreadsPerCta = 512;
+  // The copies are latency-bound peer stores, so throughput scales with
+  // concurrent CTAs rather than threads per CTA: many small CTAs on the
+  // kGridSmMultiplier-wide grid (see RaggedAllToAllThunk).
+  static constexpr size_t kThreadsPerCta = 128;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
