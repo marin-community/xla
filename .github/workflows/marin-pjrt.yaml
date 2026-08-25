@@ -2,8 +2,9 @@ name: Marin PJRT
 
 # Marin fork only. Every upstream XLA workflow is disabled in this fork. See marin/README.md.
 #
-# This builds the patched jax-cuda13-pjrt wheel and uploads it as a build artifact. Validation on
-# a GB200 and release publication come in a later change.
+# Build the patched jax-cuda13-pjrt wheel, publish it as an unvalidated candidate prerelease,
+# prove on a GB200 that its XLA change is live, then promote the same bytes to a release with
+# the manifest Marin pins from.
 
 on:
   push:
@@ -36,6 +37,7 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       upstream_base: ${{ steps.identity.outputs.upstream_base }}
       candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
       wheel_name: ${{ steps.wheel.outputs.name }}
       wheel_sha256: ${{ steps.wheel.outputs.sha256 }}
     steps:
@@ -72,6 +74,7 @@ jobs:
           {
             echo "upstream_base=${UPSTREAM_BASE}"
             echo "candidate_tag=marin-xla-pjrt-candidate-$(git rev-parse --short=12 "$GITHUB_SHA")"
+            echo "release_tag=marin-xla-pjrt-$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")-$(git rev-parse --short=12 "$GITHUB_SHA")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Reclaim runner disk and add swap
@@ -153,6 +156,8 @@ jobs:
     # Only this job writes. The multi-hour build job stays read-only.
     permissions:
       contents: write
+    outputs:
+      wheel_url: ${{ steps.publish.outputs.wheel_url }}
     env:
       GH_TOKEN: ${{ github.token }}
       CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
@@ -188,6 +193,7 @@ jobs:
           cat candidate/marin-xla-pjrt-candidate.json
 
       - name: Publish once
+        id: publish
         # A candidate names one commit, so republishing it would mean two different sets of bytes
         # under one tag. Refuse instead.
         run: |
@@ -202,3 +208,174 @@ jobs:
             --title "Candidate ${CANDIDATE_TAG##*-}" \
             --notes "Unvalidated build of \`${{ github.sha }}\`. No GB200 validation has run against these bytes, so Marin must not pin them. SHA-256 \`${WHEEL_SHA256}\`." \
             candidate/*.whl candidate/*.json
+          # The validation job fetches the wheel by URL, because it is far past the 25MB Iris
+          # bundle cap. Percent-encode the '+' in the version, as a release asset URL does.
+          ENCODED=$(python -c "import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=''))" "$WHEEL_NAME")
+          echo "wheel_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$CANDIDATE_TAG/$ENCODED" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate on GB200
+    needs: [build, publish_candidate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token WIF exchanges for github-iris
+    env:
+      JOB_USER: xla-ci
+      WHEEL_URL: ${{ needs.publish_candidate.outputs.wheel_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.21"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        run: |
+          uv tool install --prerelease allow marin-core
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Run the hardware gate
+        id: iris
+        continue-on-error: true
+        env:
+          JOB_NAME: xla-pjrt-${{ github.run_id }}-${{ github.run_attempt }}
+        # --exclude keeps XLA's source tree out of the workspace bundle, which Iris caps at 25MB.
+        # The wheel is fetched by URL inside the job for the same reason: it is far past that cap.
+        run: |
+          JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
+          echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
+          set -o pipefail
+          iris --cluster marin job run \
+            --target-cluster "$(jq -r .validation.target_cluster "$RELEASE_CONFIG")" \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --gpu "$(jq -r .validation.gpu_resource "$RELEASE_CONFIG")" --enable-extra-resources \
+            --cpu "$(jq -r .validation.cpu "$RELEASE_CONFIG")" \
+            --memory "$(jq -r .validation.memory "$RELEASE_CONFIG")" \
+            --disk 200GB \
+            --priority interactive \
+            --max-retries 0 \
+            --timeout 2400 \
+            --exclude '^(xla|third_party|docs)/' \
+            -- uv run --no-project --python 3.12 python \
+              marin/release/pjrt_validation.py validate \
+              --config "$RELEASE_CONFIG" \
+              --architecture aarch64 \
+              --hardware "$(jq -r .validation.gpu "$RELEASE_CONFIG")" \
+              --wheel-url "$WHEEL_URL" \
+              --expect-sha256 "${{ needs.build.outputs.wheel_sha256 }}" \
+              --expect-version "${{ needs.build.outputs.version }}" 2>&1 | tee validation.log
+
+      - name: Stop any Iris job left behind
+        if: always()
+        run: |
+          if [[ -n "${JOB_NAME:-}" ]]; then
+            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+          fi
+
+      - name: Enforce the gate
+        # Ahead of extract, so a failed Iris run reports its own error rather than "no record found".
+        run: |
+          if [[ "${{ steps.iris.outcome }}" != "success" ]]; then
+            echo "Iris validation failed; see validation.log" >&2
+            exit 1
+          fi
+
+      - name: Extract the validation record
+        run: |
+          python marin/release/pjrt_validation.py extract --log validation.log --output validation.json
+          cat validation.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-xla-pjrt-validation
+          path: |
+            validation.json
+            validation.log
+          if-no-files-found: error
+          retention-days: 14
+
+  promote:
+    name: Promote the validated candidate
+    needs: [build, publish_candidate, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+      RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-validation
+          path: validation
+
+      - name: Collect the exact candidate bytes
+        run: |
+          mkdir release
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir release
+          echo "${{ needs.build.outputs.wheel_sha256 }}  release/${{ needs.build.outputs.wheel_name }}" \
+            | sha256sum --check --strict
+
+      - name: Render the release manifest
+        run: |
+          python marin/release/pjrt_promote.py \
+            --config "$RELEASE_CONFIG" \
+            --candidate release/marin-xla-pjrt-candidate.json \
+            --validation validation/validation.json \
+            --release-tag "$RELEASE_TAG" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output release/marin-xla-pjrt-manifest.json
+          rm release/marin-xla-pjrt-candidate.json
+          {
+            echo "Validated on $(jq -r .hardware validation/validation.json),"
+            echo "$(jq -r .device_count validation/validation.json) devices."
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${{ needs.build.outputs.version }}\` |"
+            echo "| SHA-256 | \`${{ needs.build.outputs.wheel_sha256 }}\` |"
+            echo "| Device kernel engaged | $(jq -r .device_kernel_engaged validation/validation.json) |"
+            echo "| Promoted from | \`$CANDIDATE_TAG\` |"
+            echo
+            echo "Pin it in Marin with:"
+            echo
+            echo '```'
+            echo "uv run config/update-external.py --promote-pjrt-release marin-xla-pjrt-manifest.json"
+            echo '```'
+          } > release/release-notes.md
+
+      - name: Publish once
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ github.sha }}" \
+            --title "Marin XLA PJRT ${RELEASE_TAG#marin-xla-pjrt-}" \
+            --notes-file release/release-notes.md \
+            release/*.whl release/marin-xla-pjrt-manifest.json

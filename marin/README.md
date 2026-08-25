@@ -16,16 +16,35 @@ gh api -X PUT repos/marin-community/xla/actions/workflows/<id>/disable
 
 ## CI
 
-`.github/workflows/marin-pjrt.yaml` runs on a push to `main`, or on demand. It has two jobs. The
-first checks the pairing and builds the wheel. The second publishes the wheel as a prerelease,
-tagged `marin-xla-pjrt-candidate-<sha12>`, together with a JSON file that records the fork commit,
-the upstream base, the jax pairing, and the SHA-256.
+`.github/workflows/marin-pjrt.yaml` runs on a push to `main`, or on demand. It has four jobs:
 
-The prerelease is the durable copy. The build artifact between the two jobs expires after 14 days
-and needs credentials, but a release asset stays, and anyone can fetch it by URL.
+| Job | Runs on | Does |
+| --- | --- | --- |
+| `build` | `ubuntu-24.04-arm` | checks the pairing, builds the wheel, records its SHA-256 |
+| `publish_candidate` | hosted | publishes the wheel as a prerelease `marin-xla-pjrt-candidate-<sha12>` |
+| `validate` | GB200, through Iris | proves the device kernel engages on those exact bytes |
+| `promote` | hosted | publishes the same bytes as `marin-xla-pjrt-<date>-<sha12>`, with the manifest Marin pins from |
 
-A candidate is unvalidated. No GB200 has run these bytes, so Marin must not pin a candidate. There
-is no promotion step, and no validated release.
+The prerelease is the durable copy, and the wheel reaches the GB200 from its URL. The build
+artifact between jobs expires after 14 days and needs credentials, and it is far past the 25 MB
+limit Iris puts on a job's workspace bundle.
+
+A candidate is unvalidated. Marin must pin a promoted release, never a candidate.
+
+`validate` is what makes that distinction mean something. A wheel that does not carry the change
+still passes a correctness test, and still benchmarks as a null result, so the gate checks that the
+device kernel actually started. The kernel is opt-in behind
+`--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` and reports only through an
+`XLA_VLOG_DEVICE(3)` line on stderr.
+
+`promote` writes `marin-xla-pjrt-manifest.json`. Its shape is a contract with
+`render_pjrt_release_toml` in Marin's `config/update-external.py`, which refuses a manifest that is
+not `released`, whose validation did not pass, that does not record the device kernel engaging, or
+that names another repository. Pin a release with:
+
+```sh
+uv run config/update-external.py --promote-pjrt-release marin-xla-pjrt-manifest.json
+```
 
 Marin's change compiles into the GPU PJRT plugin, so `jax-cuda13-pjrt` is the only wheel built here.
 It is built for `aarch64` and `sm_100` (GB200). The other three wheels are stock: install `jax`,
