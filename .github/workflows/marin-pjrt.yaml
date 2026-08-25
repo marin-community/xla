@@ -1,0 +1,311 @@
+name: Marin PJRT
+
+# Marin fork only. Every upstream XLA workflow is disabled in this fork; see marin/README.md.
+#
+# One linear lane: build the patched jax-cuda13-pjrt wheel, prove on real GB200 hardware that the
+# ragged all-to-all device kernel actually engages, then publish the exact validated bytes under an
+# immutable tag together with the descriptor Marin pins.
+#
+# The wheel moves between jobs as a build artifact, so there is no intermediate prerelease to
+# promote and no published bytes to re-verify. If validation fails, re-run that job alone: it
+# re-downloads the same artifact rather than rebuilding.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      # Documentation cannot change the wheel. Everything else can, including the validation
+      # script, since a weaker gate must not silently pass a wheel that a stronger one rejected.
+      - "marin/README.md"
+  workflow_dispatch: {}
+
+concurrency:
+  group: marin-pjrt-${{ github.sha }}
+  cancel-in-progress: false   # never interrupt a run holding a GB200
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_CONFIG: marin/release/config.json
+
+jobs:
+  build:
+    name: Build the PJRT wheel
+    runs-on: ubuntu-24.04-arm
+    # GitHub-hosted jobs are hard-capped at 6h regardless of this value. A cold XLA+jaxlib CUDA
+    # compile is the risk; at a fixed base every rebuild is a warm incremental because the delta is
+    # four files. If a cold build ever fails to fit, seed the bazel cache from one Iris run rather
+    # than moving this lane off hosted runners.
+    timeout-minutes: 355
+    outputs:
+      fork_commit: ${{ steps.identity.outputs.fork_commit }}
+      upstream_base: ${{ steps.identity.outputs.upstream_base }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      version: ${{ steps.identity.outputs.version }}
+      wheel_name: ${{ steps.wheel.outputs.name }}
+      wheel_sha256: ${{ steps.wheel.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history: the merge-base below defines the carried delta, and a shallow checkout
+          # silently yields the wrong base.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Preflight the pairing
+        id: identity
+        # Everything here runs in seconds, before the compile, so an incoherent pairing costs
+        # seconds rather than hours. merge-base (not a local ancestry test) is what identifies the
+        # most recent upstream commit under our overlay: an overlay rebased onto a newer upstream
+        # tip still has the jax-pinned commit as an ancestor, and only merge-base sees it moved.
+        run: |
+          git remote add upstream https://github.com/openxla/xla.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/openxla/xla.git
+          git fetch --quiet --no-tags upstream main
+          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+
+          # preflight asserts the base is what jax_commit pins and that the sibling generation was
+          # actually published, then emits version= and jax_build_date= on stdout.
+          python marin/release/pjrt_release.py preflight \
+            --config "$RELEASE_CONFIG" \
+            --fork-commit "$GITHUB_SHA" \
+            --base "$UPSTREAM_BASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "fork_commit=$GITHUB_SHA"
+            echo "upstream_base=${UPSTREAM_BASE}"
+            echo "release_tag=marin-xla-pjrt-$(git show -s --format=%cd --date=format:%Y%m%d "$GITHUB_SHA")-$(git rev-parse --short=12 "$GITHUB_SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim runner disk and add swap
+        # Bazel's link steps peak past the runner's RAM and OOM-kill the agent mid-build (frozen
+        # step, no logs). Free disk and back the spikes with swap so the build fits.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h /
+          free -h
+
+      - name: Install the host toolchain
+        # jax's build is hermetic for CUDA but needs a local clang on non-x86_64 Linux.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+          clang --version
+
+      - name: Restore the bazel cache
+        continue-on-error: true   # a cache hiccup must never fail a pin-critical build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-aarch64-${{ steps.identity.outputs.upstream_base }}-${{ github.sha }}
+          restore-keys: |
+            bazel-aarch64-${{ steps.identity.outputs.upstream_base }}-
+            bazel-aarch64-
+
+      - name: Build
+        env:
+          XLA_SOURCE: ${{ github.workspace }}
+          MARIN_XLA_COMMIT: ${{ github.sha }}
+          OUT_DIR: ${{ github.workspace }}/dist
+          WORK_DIR: ${{ runner.temp }}/build
+        run: |
+          JAX_COMMIT=$(jq -r .jax_commit "$RELEASE_CONFIG")
+          JAX_WHEEL_BUILD_DATE=${{ steps.identity.outputs.jax_build_date }}
+          BAZEL_JOBS=$(jq -r .platforms.aarch64.bazel_jobs "$RELEASE_CONFIG")
+          CUDA_COMPUTE_CAPABILITIES=$(jq -r .platforms.aarch64.cuda_compute_capabilities "$RELEASE_CONFIG")
+          export JAX_COMMIT JAX_WHEEL_BUILD_DATE BAZEL_JOBS CUDA_COMPUTE_CAPABILITIES
+          bash marin/build_pjrt.sh
+
+      - name: Identify the wheel
+        id: wheel
+        run: |
+          WHEEL=$(ls dist/jax_cuda13_pjrt-*.whl)
+          NAME=$(basename "$WHEEL")
+          # A wrong ML_WHEEL_BUILD_DATE yields a wheel the stock plugin refuses. Catch it here,
+          # before anything is published.
+          case "$NAME" in
+            *"${{ steps.identity.outputs.version }}"*) ;;
+            *) echo "$NAME does not carry ${{ steps.identity.outputs.version }}" >&2; exit 1 ;;
+          esac
+          MAX_MB=$(jq -r .platforms.aarch64.max_wheel_size_mb "$RELEASE_CONFIG")
+          SIZE_MB=$(( $(stat -c%s "$WHEEL") / 1048576 ))
+          [ "$SIZE_MB" -le "$MAX_MB" ] || { echo "wheel is ${SIZE_MB}MB, over ${MAX_MB}MB" >&2; exit 1; }
+          {
+            echo "name=${NAME}"
+            echo "sha256=$(sha256sum "$WHEEL" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marin-xla-pjrt-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  validate:
+    name: Validate on GB200
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token WIF exchanges for github-iris
+    env:
+      JOB_USER: xla-ci
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-wheel
+          path: dist
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.21"
+
+      - name: Trim the Iris bundle
+        # The job reads only marin/release/ and the wheel; XLA's source tree would blow the cap.
+        run: git rm -r --quiet --cached xla third_party docs >/dev/null 2>&1 || true
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        run: |
+          uv tool install --prerelease allow marin-core
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Run the hardware gate
+        id: iris
+        continue-on-error: true
+        env:
+          JOB_NAME: xla-pjrt-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
+          echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
+          set -o pipefail
+          iris --cluster marin job run \
+            --target-cluster "$(jq -r .platforms.aarch64.validation.target_cluster "$RELEASE_CONFIG")" \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --gpu "$(jq -r .platforms.aarch64.validation.gpu_resource "$RELEASE_CONFIG")" --enable-extra-resources \
+            --cpu "$(jq -r .platforms.aarch64.validation.cpu "$RELEASE_CONFIG")" \
+            --memory "$(jq -r .platforms.aarch64.validation.memory "$RELEASE_CONFIG")" \
+            --disk 200GB \
+            --priority interactive \
+            --no-sync \
+            --max-retries 0 \
+            --timeout 2400 \
+            -- uv run --no-project --python 3.12 python \
+              marin/release/pjrt_validation.py validate \
+              --config "$RELEASE_CONFIG" \
+              --architecture aarch64 \
+              --hardware "$(jq -r .platforms.aarch64.validation.gpu "$RELEASE_CONFIG")" \
+              --wheel "dist/${{ needs.build.outputs.wheel_name }}" \
+              --expect-sha256 "${{ needs.build.outputs.wheel_sha256 }}" 2>&1 | tee validation.log
+
+      - name: Stop any Iris job left behind
+        if: always()
+        run: |
+          if [[ -n "${JOB_NAME:-}" ]]; then
+            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+          fi
+
+      - name: Extract the validation record
+        run: |
+          python marin/release/pjrt_validation.py extract \
+            --log validation.log --output validation.json
+          cat validation.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-xla-pjrt-validation
+          path: |
+            validation.json
+            validation.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce the gate
+        run: |
+          if [[ "${{ steps.iris.outcome }}" != "success" ]]; then
+            echo "Iris validation failed." >&2
+            exit 1
+          fi
+
+  publish:
+    name: Publish the validated release
+    needs: [build, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-wheel
+          path: release
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-validation
+          path: validation
+
+      - name: Verify the artifact is the validated bytes
+        run: |
+          echo "${{ needs.build.outputs.wheel_sha256 }}  release/${{ needs.build.outputs.wheel_name }}" \
+            | sha256sum --check --strict
+
+      - name: Render the release
+        run: |
+          python marin/release/pjrt_release.py render \
+            --config "$RELEASE_CONFIG" \
+            --fork-commit "${{ needs.build.outputs.fork_commit }}" \
+            --upstream-base "${{ needs.build.outputs.upstream_base }}" \
+            --release-tag "$RELEASE_TAG" \
+            --wheel-name "${{ needs.build.outputs.wheel_name }}" \
+            --wheel-sha256 "${{ needs.build.outputs.wheel_sha256 }}" \
+            --validation validation/validation.json \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --out-dir release
+
+      - name: Publish once
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ needs.build.outputs.fork_commit }}" \
+            --title "Marin XLA PJRT ${RELEASE_TAG#marin-xla-pjrt-}" \
+            --notes-file release/release-notes.md \
+            release/*.whl release/marin-xla-pjrt-manifest.json release/pjrt-release.toml
