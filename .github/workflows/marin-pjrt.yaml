@@ -2,7 +2,7 @@ name: Marin PJRT
 
 # Marin fork only. Every upstream XLA workflow is disabled in this fork; see marin/README.md.
 #
-# One linear lane: build the patched jax-cuda13-pjrt wheel, prove on real GB200 hardware that the
+# One linear workflow: build the patched jax-cuda13-pjrt wheel, prove on real GB200 hardware that the
 # ragged all-to-all device kernel actually engages, then publish the exact validated bytes under an
 # immutable tag together with the descriptor Marin pins.
 #
@@ -36,7 +36,7 @@ jobs:
     # GitHub-hosted jobs are hard-capped at 6h regardless of this value. A cold XLA+jaxlib CUDA
     # compile is the risk; at a fixed base every rebuild is a warm incremental because the delta is
     # four files. If a cold build ever fails to fit, seed the bazel cache from one Iris run rather
-    # than moving this lane off hosted runners.
+    # than moving this build off hosted runners.
     timeout-minutes: 355
     outputs:
       fork_commit: ${{ steps.identity.outputs.fork_commit }}

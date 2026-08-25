@@ -2,13 +2,13 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Helpers for the Marin PJRT lane: preflight checks and release rendering.
+"""Helpers for the Marin PJRT workflow: preflight checks and release rendering.
 
 The fork carries a small XLA delta on the upstream commit a published jax revision pins. Only the
 GPU PJRT plugin embeds that delta, so one wheel is built and its stock siblings come from the jax
 nightly index at the same generation.
 
-This is deliberately thin. The lane is a single linear workflow -- build, validate, publish -- so
+This is deliberately thin. The workflow is linear -- build, validate, publish -- so
 there is no cross-workflow handoff to re-verify and no multi-architecture manifest to merge.
 """
 
