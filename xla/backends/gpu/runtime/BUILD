@@ -2320,6 +2320,7 @@ cc_library(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:trace_command_buffer_factory",
         "//xla/stream_executor/gpu:multi_gpu_barrier_kernel",
+        "//xla/stream_executor/gpu:ragged_all_to_all_device_kernel",
         "//xla/stream_executor/gpu:ragged_all_to_all_kernel",
         "//xla/tsl/util:tied_ref",
         "@com_google_absl//absl/algorithm:container",
