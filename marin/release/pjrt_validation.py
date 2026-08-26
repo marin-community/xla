@@ -39,7 +39,15 @@ from pathlib import Path
 MARKER = "MARIN_XLA_PJRT_VALIDATION"
 RESULT_MARKER = "MARIN_RAGGED_RESULT"
 DEVICE_KERNEL_LOG_PATTERN = "Device kernel: lsa_size="
-DEVICE_KERNEL_FLAG = "--xla_gpu_experimental_ragged_all_to_all_use_device_kernel=true"
+# The device kernel is gated on more than its own flag. ragged_all_to_all_thunk.cc engages it only
+# when collective memory is present and both the source and destination buffers resolve through
+# FindSymmetricMemory. Ragged all-to-all defaults to COLLECTIVES_PRIVATE_MEMORY, where they never
+# do, so the mode has to be switched as well: symmetric memory is what the thunk's comment calls
+# "device-initiated collectives that run as device kernels".
+DEVICE_KERNEL_FLAGS = (
+    "--xla_gpu_experimental_ragged_all_to_all_use_device_kernel=true",
+    "--xla_gpu_ragged_all_to_all_mode=symmetric",
+)
 SIBLING_TAG = "cp312-cp312-manylinux_2_27_aarch64"
 PURE_TAG = "py3-none-manylinux_2_27_aarch64"
 
@@ -163,7 +171,7 @@ def command_validate(args: argparse.Namespace) -> None:
 
     environment = dict(
         os.environ,
-        XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), DEVICE_KERNEL_FLAG))),
+        XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), *DEVICE_KERNEL_FLAGS))),
         TF_CPP_MAX_VLOG_LEVEL="3",
     )
     completed = subprocess.run([python, "-c", EXERCISE], env=environment, capture_output=True, text=True, check=False)
@@ -195,8 +203,18 @@ def command_validate(args: argparse.Namespace) -> None:
         "status": "passed" if (record["correct"] and engaged) else "failed",
     }
     print(f"{MARKER} {json.dumps(result, sort_keys=True)}", flush=True)
-    if result["status"] != "passed":
-        raise SystemExit("validation failed: " + ("device kernel did not engage" if record["correct"] else "incorrect"))
+    if not record["correct"]:
+        raise SystemExit("validation failed: the ragged all-to-all result is wrong")
+    if not engaged:
+        # The thunk logs lsa_size before it decides, and logs a separate line when it declines, so
+        # these say how far it got. Without them "did not engage" costs a whole run to localize.
+        trace = [
+            line.strip()
+            for line in combined.splitlines()
+            if "lsa_size" in line or "Device kernel" in line or "SupportsDeviceComm" in line
+        ]
+        detail = "\n  ".join(trace) if trace else "the thunk logged nothing about lsa_size"
+        raise SystemExit(f"validation failed: device kernel did not engage\n  {detail}")
 
 
 def command_extract(args: argparse.Namespace) -> None:
