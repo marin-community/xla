@@ -32,6 +32,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -105,9 +106,13 @@ def fetch_wheel(url: str, sha256: str, destination: Path) -> Path:
     The wheel arrives by URL rather than in the Iris bundle. Iris lists bundle files with
     ``git ls-files --cached --others --exclude-standard`` under a 25 MB cap, which a >100 MB wheel
     cannot fit.
+
+    The URL percent-encodes the ``+`` that opens the version's local segment, so the basename has
+    to be decoded before it names a file. ``uv pip install`` reads the version out of the filename
+    and rejects ``...dev20260824%2Bmarin...`` as invalid.
     """
     destination.mkdir(parents=True, exist_ok=True)
-    path = destination / url.rsplit("/", 1)[1]
+    path = destination / urllib.parse.unquote(url.rsplit("/", 1)[1])
     urllib.request.urlretrieve(url, path)  # noqa: S310 - a release asset URL from our own config
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != sha256:
