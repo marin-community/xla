@@ -186,11 +186,29 @@ def install_runtime(config: dict, wheel: Path, python: str) -> None:
     subprocess.run(["uv", "pip", "install", "--python", python, "--no-deps", "--reinstall", str(wheel)], check=True)
 
 
+# Below the ephemeral range, which starts at 32768 on Linux by default. Asking the kernel for a
+# port with bind(0) draws from that range, and the kernel then hands the same port to one of the
+# exercise's own outbound gRPC connections before JAX binds it, so the coordinator dies with
+# "Address already in use". Picking from a fixed band underneath it removes that competition.
+COORDINATOR_PORT_BASE = 29500
+COORDINATOR_PORT_ATTEMPTS = 64
+
+
 def free_port() -> int:
-    """Reserve a loopback port for the JAX coordinator, then release it for JAX to bind."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """Return a port for the JAX coordinator, chosen from below the ephemeral range."""
+    for offset in range(COORDINATOR_PORT_ATTEMPTS):
+        candidate = COORDINATOR_PORT_BASE + offset
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("", candidate))
+            except OSError:
+                continue
+        return candidate
+    raise SystemExit(
+        f"no free coordinator port in {COORDINATOR_PORT_BASE}-"
+        f"{COORDINATOR_PORT_BASE + COORDINATOR_PORT_ATTEMPTS - 1}"
+    )
 
 
 def run_exercise(python: str, processes: int, args_download_dir: str) -> tuple[str, list[dict]]:
@@ -204,7 +222,7 @@ def run_exercise(python: str, processes: int, args_download_dir: str) -> tuple[s
         # because raising it globally emits about 80k lines per process.
         TF_CPP_MIN_LOG_LEVEL="0",
         TF_CPP_VMODULE="ragged_all_to_all_thunk=3",
-        MARIN_COORDINATOR=f"127.0.0.1:{free_port()}",
+        MARIN_COORDINATOR=f"localhost:{free_port()}",
         MARIN_NUM_PROCESSES=str(processes),
     )
     # Each child writes to its own file rather than a pipe. Reading one child to completion while
