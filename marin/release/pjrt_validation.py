@@ -35,6 +35,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -45,6 +46,12 @@ from pathlib import Path
 MARKER = "MARIN_XLA_PJRT_VALIDATION"
 RESULT_MARKER = "MARIN_RAGGED_RESULT"
 DEVICE_KERNEL_LOG_PATTERN = "Device kernel: lsa_size="
+# The thunk logs lsa_size unconditionally in InitializeOnce, so this line appears on every run that
+# reaches the collective, whatever the kernel then decides.
+LSA_LOG_PATTERN = "lsa_size:"
+# absl writes "I0826 22:40:42.123456 12345 file.cc:123] ...". Finding none of these means the
+# runtime's logging never reached this process, which is a blind gate rather than a verdict.
+ABSL_LOG_PATTERN = re.compile(r"^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\S+:\d+\]", re.MULTILINE)
 # The device kernel is gated on more than its own flag. ragged_all_to_all_thunk.cc engages it only
 # when collective memory is present and both the source and destination buffers resolve through
 # FindSymmetricMemory. Ragged all-to-all defaults to COLLECTIVES_PRIVATE_MEMORY, where they never
@@ -185,6 +192,10 @@ def run_exercise(python: str, processes: int) -> tuple[str, list[dict]]:
         os.environ,
         XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), *DEVICE_KERNEL_FLAGS))),
         TF_CPP_MAX_VLOG_LEVEL="3",
+        # The global level alone produced no runtime logging at all on the first multi-process run.
+        # A file-scoped vmodule goes through absl::SetVLogLevel instead, and keeps the output small
+        # enough to read.
+        TF_CPP_VMODULE="ragged_all_to_all_thunk=3",
         MARIN_COORDINATOR=f"127.0.0.1:{free_port()}",
         MARIN_NUM_PROCESSES=str(processes),
     )
@@ -264,15 +275,27 @@ def command_validate(args: argparse.Namespace) -> None:
         wrong = [entry["process_id"] for entry in records if not entry["correct"]]
         raise SystemExit(f"validation failed: the ragged all-to-all result is wrong in processes {wrong}")
     if not engaged:
-        # The thunk logs lsa_size before it decides, and logs a separate line when it declines, so
-        # these say how far it got. Without them "did not engage" costs a whole run to localize.
+        # Three different failures look identical without this. The thunk logs lsa_size before it
+        # decides and logs a separate line when it declines, so those say how far it got. If no absl
+        # log line arrived at all, the gate never saw the runtime and cannot report a verdict.
         trace = [
             line.strip()
             for line in combined.splitlines()
-            if "lsa_size" in line or "Device kernel" in line or "SupportsDeviceComm" in line
+            if LSA_LOG_PATTERN in line or "Device kernel" in line or "requires GIN" in line
         ]
-        detail = "\n  ".join(trace) if trace else "the thunk logged nothing about lsa_size"
-        raise SystemExit(f"validation failed: device kernel did not engage\n  {detail}")
+        if trace:
+            raise SystemExit("validation failed: device kernel did not engage\n  " + "\n  ".join(trace))
+        if ABSL_LOG_PATTERN.search(combined):
+            raise SystemExit(
+                "validation failed: device kernel did not engage, and the thunk never logged "
+                f"{LSA_LOG_PATTERN!r}, so the collective did not reach InitializeOnce"
+            )
+        raise SystemExit(
+            "validation is blind: the runtime emitted no absl log lines, so neither "
+            f"{LSA_LOG_PATTERN!r} nor {DEVICE_KERNEL_LOG_PATTERN!r} could ever appear. "
+            "Fix the logging before trusting this gate: TF_CPP_MAX_VLOG_LEVEL and TF_CPP_VMODULE "
+            "are set, so the runtime is not honouring them."
+        )
 
 
 def command_extract(args: argparse.Namespace) -> None:
