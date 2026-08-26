@@ -252,7 +252,8 @@ absl::Status RunDeviceRaggedAllToAllKernel(
   // The copies are latency-bound peer stores, so throughput scales with
   // concurrent CTAs rather than threads per CTA: many small CTAs on the
   // kGridSmMultiplier-wide grid (see RaggedAllToAllThunk).
-  static constexpr size_t kThreadsPerCta = 128;
+  static constexpr size_t kThreadsPerCta =
+      se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
