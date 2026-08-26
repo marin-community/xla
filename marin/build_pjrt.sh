@@ -32,7 +32,9 @@ mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 # The local segment records the exact XLA tip the wheel was built from, so an installed wheel
-# names its own provenance without a manifest lookup.
+# names its own provenance without a manifest lookup. It goes in ML_WHEEL_VERSION_SUFFIX, not
+# ML_WHEEL_GIT_HASH: jax applies .lstrip('0')[:9] to the git hash, which cut
+# "marin.<sha12>" down to "marin.ad3" and produced a wheel the stock plugin would refuse.
 SHORT_XLA="${MARIN_XLA_COMMIT:0:12}"
 
 work="${WORK_DIR:-$(mktemp -d)}"
@@ -65,7 +67,7 @@ python3 build/build.py build \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=custom \
   --bazel_options=--repo_env=ML_WHEEL_BUILD_DATE="$JAX_WHEEL_BUILD_DATE" \
-  --bazel_options=--repo_env=ML_WHEEL_GIT_HASH="marin.${SHORT_XLA}" \
+  --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="marin.${SHORT_XLA}" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 
