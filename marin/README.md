@@ -57,22 +57,34 @@ specifier has none, so this version satisfies the plugin's pin and still records
 
 ## How to refresh onto a newer upstream
 
-Marin drives a refresh through `.agents/skills/refresh-fork/SKILL.md`, against the `[xla]` section of
-`config/external/migration.toml`.
+Refreshing is manual. There is no scheduled rebase, and no agent drives one.
 
 The base is derived. Do not rebase onto an upstream `main` tip. jax pins an exact XLA tarball by
 integrity hash, and builds its dependency graph from XLA module extensions, so the two change
 together most days. A base that no published jax generation pins can compile and then fail at run
-time.
+time. An eligible base is an XLA commit that a published jax generation pins, at or after
+`79bf62815c7cadfd263d5cdcd4e7116df13f647d`. That commit fixed the bug that kept the device kernel
+out of Marin's configuration.
 
 1. Choose a jax revision that has published nightly wheels.
 2. Read the XLA commit it pins, from `MODULE.bazel` in the jax repository.
-3. Rebase Marin's commits onto that XLA commit, on a branch named
-   `auto-refresh/<YYYYMMDD>/<base-id>-<shortsha>`.
+3. Rebase Marin's commits onto that XLA commit, on a branch.
 4. Set `jax_commit` and `jax_version` in `marin/release/config.json` to that jax revision, in the
    same commit as the rebase.
-5. Merge into `main`. CI then builds the wheel.
+5. Push the branch, then start CI on it:
+
+   ```sh
+   gh workflow run marin-pjrt.yaml --repo marin-community/xla --ref <branch>
+   ```
+
+6. Review the promoted release. An admin then moves `main` to that branch. `main` is protected
+   against force-push, so this step is deliberate. A merge does not work here, because the rebase
+   replaces history and a squash merge would leave the old base as the merge-base.
+7. Re-pin Marin from the promoted manifest, with `--promote-pjrt-release` above.
 
 `marin/release/pjrt_release.py` checks steps 2 to 4 before the compile, and fails in seconds. It
 rejects a base that is not what `jax_commit` pins, in either direction. It also rejects a
 `jax_version` whose sibling wheels are absent from the nightly index.
+
+The nightly index is a consequence of the base. When a stable jax release pins an XLA at or after
+the commit above, move to that stable base and take the three sibling wheels from PyPI.
