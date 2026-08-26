@@ -11,8 +11,14 @@ name: Marin PJRT
 on:
   push:
     branches: [main]
+    # A cold build is three and a half hours, so do not start one for a change that cannot reach
+    # the wheel. Promotion runs from a published candidate in its own workflow, so its files and
+    # the documentation change without rebuilding anything.
     paths-ignore:
-      - "marin/README.md"   # documentation cannot change the wheel
+      - "marin/README.md"
+      - "marin/release/pjrt_validation.py"
+      - "marin/release/pjrt_promote.py"
+      - ".github/workflows/marin-pjrt-promote.yaml"
   workflow_dispatch: {}
 
 concurrency:
