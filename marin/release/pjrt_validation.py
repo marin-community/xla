@@ -35,6 +35,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -45,14 +46,27 @@ from pathlib import Path
 MARKER = "MARIN_XLA_PJRT_VALIDATION"
 RESULT_MARKER = "MARIN_RAGGED_RESULT"
 DEVICE_KERNEL_LOG_PATTERN = "Device kernel: lsa_size="
+# The thunk logs lsa_size unconditionally in InitializeOnce, so this line appears on every run that
+# reaches the collective, whatever the kernel then decides.
+LSA_LOG_PATTERN = "lsa_size:"
+# absl writes "I0826 22:40:42.123456 12345 file.cc:123] ...". Finding none of these means the
+# runtime's logging never reached this process, which is a blind gate rather than a verdict.
+ABSL_LOG_PATTERN = re.compile(r"^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\S+:\d+\]", re.MULTILINE)
 # The device kernel is gated on more than its own flag. ragged_all_to_all_thunk.cc engages it only
 # when collective memory is present and both the source and destination buffers resolve through
 # FindSymmetricMemory. Ragged all-to-all defaults to COLLECTIVES_PRIVATE_MEMORY, where they never
 # do, so the mode has to be switched as well: symmetric memory is what the thunk's comment calls
 # "device-initiated collectives that run as device kernels".
 DEVICE_KERNEL_FLAGS = (
+    # Opt into the kernel at all.
     "--xla_gpu_experimental_ragged_all_to_all_use_device_kernel=true",
+    # Take the put/signal path. Without it the mode is COLLECTIVES_PRIVATE_MEMORY.
     "--xla_gpu_ragged_all_to_all_mode=symmetric",
+    # Actually allocate the buffers symmetrically. Without these two, FindSymmetricMemory returns
+    # null and the thunk declines on the one branch that logs nothing at all, which is why three
+    # earlier runs reported "did not engage" with no explanation.
+    "--xla_gpu_experimental_enable_nccl_symmetric_buffers=true",
+    "--xla_enable_nccl_symmetric_buffers_for_collectives=raggedalltoall",
 )
 SIBLING_TAG = "cp312-cp312-manylinux_2_27_aarch64"
 PURE_TAG = "py3-none-manylinux_2_27_aarch64"
@@ -179,30 +193,48 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def run_exercise(python: str, processes: int) -> tuple[str, list[dict]]:
+def run_exercise(python: str, processes: int, args_download_dir: str) -> tuple[str, list[dict]]:
     """Run one exercise process per GPU and return their combined output and result records."""
     environment = dict(
         os.environ,
         XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), *DEVICE_KERNEL_FLAGS))),
-        TF_CPP_MAX_VLOG_LEVEL="3",
+        # VLOG lines are logged at INFO severity and the task image suppresses INFO, so the level
+        # alone emits nothing: measured 0 log lines with TF_CPP_MAX_VLOG_LEVEL=3 by itself and
+        # 1283 once INFO was allowed through. Scope the level to the one file that matters,
+        # because raising it globally emits about 80k lines per process.
+        TF_CPP_MIN_LOG_LEVEL="0",
+        TF_CPP_VMODULE="ragged_all_to_all_thunk=3",
         MARIN_COORDINATOR=f"127.0.0.1:{free_port()}",
         MARIN_NUM_PROCESSES=str(processes),
     )
+    # Each child writes to its own file rather than a pipe. Reading one child to completion while
+    # another fills its 64 KB pipe buffer stalls that child past the JAX distributed heartbeat, and
+    # the coordination service then aborts every process with "stopped sending heartbeats". The
+    # verbose logging this gate needs makes that certain rather than unlikely.
+    logs = [Path(args_download_dir) / f"exercise-{index}.log" for index in range(processes)]
+    handles = [path.open("w+b") for path in logs]
     children = [
         subprocess.Popen(  # noqa: S603 - our own interpreter and source
             [python, "-c", EXERCISE],
             env=dict(environment, MARIN_PROCESS_ID=str(index)),
-            stdout=subprocess.PIPE,
+            stdout=handles[index],
             stderr=subprocess.STDOUT,
-            text=True,
         )
         for index in range(processes)
     ]
-    outputs = [child.communicate()[0] for child in children]
+    codes = [child.wait() for child in children]
+    outputs = []
+    for handle in handles:
+        handle.flush()
+        handle.seek(0)
+        # The verbose stream is not always valid UTF-8, and a decode error here would look like a
+        # validation failure rather than a logging one.
+        outputs.append(handle.read().decode("utf-8", "replace"))
+        handle.close()
     combined = "".join(outputs)
     sys.stderr.write(combined)
 
-    failed = [index for index, child in enumerate(children) if child.returncode != 0]
+    failed = [index for index, code in enumerate(codes) if code != 0]
     if failed:
         raise SystemExit(f"ragged all-to-all exercise failed in processes {failed}")
 
@@ -239,7 +271,7 @@ def command_validate(args: argparse.Namespace) -> None:
         raise SystemExit(f"installed {versions['jax-cuda13-pjrt']}, candidate is {args.expect_version}")
 
     processes = config["validation"]["processes"]
-    combined, records = run_exercise(python, processes)
+    combined, records = run_exercise(python, processes, args.download_dir)
     if len(records) != processes:
         raise SystemExit(f"expected {processes} result records, got {len(records)}")
     record = records[0]
@@ -264,15 +296,23 @@ def command_validate(args: argparse.Namespace) -> None:
         wrong = [entry["process_id"] for entry in records if not entry["correct"]]
         raise SystemExit(f"validation failed: the ragged all-to-all result is wrong in processes {wrong}")
     if not engaged:
-        # The thunk logs lsa_size before it decides, and logs a separate line when it declines, so
-        # these say how far it got. Without them "did not engage" costs a whole run to localize.
+        # Three different failures look identical without this. The thunk logs lsa_size before it
+        # decides and logs a separate line when it declines, so those say how far it got. If no absl
+        # log line arrived at all, the gate never saw the runtime and cannot report a verdict.
         trace = [
             line.strip()
             for line in combined.splitlines()
-            if "lsa_size" in line or "Device kernel" in line or "SupportsDeviceComm" in line
+            if LSA_LOG_PATTERN in line or "Device kernel" in line or "requires GIN" in line
         ]
-        detail = "\n  ".join(trace) if trace else "the thunk logged nothing about lsa_size"
-        raise SystemExit(f"validation failed: device kernel did not engage\n  {detail}")
+        if trace:
+            raise SystemExit("validation failed: device kernel did not engage\n  " + "\n  ".join(trace))
+        raise SystemExit(
+            f"validation is blind: the thunk never logged {LSA_LOG_PATTERN!r}, which it does "
+            "unconditionally in InitializeOnce whenever the collective runs. Neither that line nor "
+            f"{DEVICE_KERNEL_LOG_PATTERN!r} could appear, so this says nothing about the wheel. "
+            "Check the logging environment first. Any absl line proves only that the severity "
+            "threshold lets warnings through, not that VLOG is on."
+        )
 
 
 def command_extract(args: argparse.Namespace) -> None:
