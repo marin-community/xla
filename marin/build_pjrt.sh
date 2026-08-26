@@ -8,10 +8,9 @@
 #
 # The built wheel must satisfy the stock plugin's exact `jax-cuda13-pjrt==<JAX_VERSION>` pin.
 # Under ML_WHEEL_TYPE=custom, jax derives the version as
-# `<base>.dev<ML_WHEEL_BUILD_DATE><ML_WHEEL_VERSION_SUFFIX>`, appending the suffix verbatim. PEP 440
-# ignores a local segment when the specifier has none, so `0.11.2.dev20260824+marin.<sha12>`
-# resolves against `==0.11.2.dev20260824`. Getting the date wrong silently produces a wheel the
-# plugin will refuse.
+# `<base>.dev<ML_WHEEL_BUILD_DATE>+<ML_WHEEL_GIT_HASH><ML_WHEEL_VERSION_SUFFIX>`. PEP 440 ignores a
+# local segment when the specifier has none, so `0.11.2.dev20260824+marin.<sha12>` resolves against
+# `==0.11.2.dev20260824`. Getting the date wrong silently produces a wheel the plugin will refuse.
 #
 # usage: XLA_SOURCE=<path> JAX_COMMIT=<sha> JAX_VERSION=<version> JAX_WHEEL_BUILD_DATE=YYYYMMDD \
 #        MARIN_XLA_COMMIT=<sha> MARIN_EXPECT_VERSION=<version> OUT_DIR=<path> \
@@ -37,17 +36,27 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 # The local segment records the exact XLA tip the wheel was built from, so an installed wheel
 # names its own provenance without a manifest lookup.
 #
-# It goes in ML_WHEEL_VERSION_SUFFIX, not ML_WHEEL_GIT_HASH, because jax truncates the git hash
-# with .lstrip('0')[:9]. The suffix is not truncated, but python_wheel.bzl appends it verbatim and
-# emits the '+' only for the git hash, so this script owns the '+' that opens the local segment.
+# jax composes this version twice, from two files that agree only when ML_WHEEL_GIT_HASH is set:
 #
-# Derive the suffix from the version the preflight already computed, rather than rebuilding the
-# string here, and refuse a build whose two halves disagree. The version is otherwise materialized
-# by the wheel-packaging action at the very end, so a mismatch costs an entire compile.
+#   third_party/py/python_wheel.bzl, which names the wheel:
+#     ".dev<date>", then "+<hash>" only when the hash is set, then the suffix verbatim
+#   jax's build/build.py, which globs that wheel out of bazel-bin afterwards:
+#     ".dev<date>", then "+<hash><suffix>" unconditionally
+#
+# With an empty hash the first emits no '+' and the second emits one. A suffix carrying its own '+'
+# then builds a correctly named wheel that the glob never matches, and a suffix without one builds
+# a version setuptools rejects. Both halves must therefore be used: the marker goes in the hash,
+# which both files truncate identically with .lstrip('0')[:9], and the commit goes in the suffix,
+# which neither truncates.
 SHORT_XLA="${MARIN_XLA_COMMIT:0:12}"
-VERSION_SUFFIX="${MARIN_EXPECT_VERSION#"$JAX_VERSION"}"
-if [ "$VERSION_SUFFIX" != "+marin.${SHORT_XLA}" ]; then
-  echo "expected ${JAX_VERSION}+marin.${SHORT_XLA}, but the preflight computed ${MARIN_EXPECT_VERSION}" >&2
+WHEEL_GIT_HASH=marin
+WHEEL_VERSION_SUFFIX=".${SHORT_XLA}"
+
+# Compose it here the way both files will, and refuse a build whose halves disagree with the
+# preflight. The version is otherwise only materialized by the last action of the compile.
+COMPOSED="${JAX_VERSION}+${WHEEL_GIT_HASH}${WHEEL_VERSION_SUFFIX}"
+if [ "$COMPOSED" != "$MARIN_EXPECT_VERSION" ]; then
+  echo "this build would make ${COMPOSED}, but the preflight computed ${MARIN_EXPECT_VERSION}" >&2
   exit 1
 fi
 
@@ -81,7 +90,8 @@ python3 build/build.py build \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=custom \
   --bazel_options=--repo_env=ML_WHEEL_BUILD_DATE="$JAX_WHEEL_BUILD_DATE" \
-  --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$VERSION_SUFFIX" \
+  --bazel_options=--repo_env=ML_WHEEL_GIT_HASH="$WHEEL_GIT_HASH" \
+  --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$WHEEL_VERSION_SUFFIX" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 
