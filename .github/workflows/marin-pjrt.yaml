@@ -99,8 +99,9 @@ jobs:
           clang --version
 
       - name: Restore the bazel cache
+        id: bazel-cache
         continue-on-error: true   # a cache fault must not fail the build
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/bazel
           key: bazel-aarch64-${{ github.sha }}
@@ -138,6 +139,16 @@ jobs:
             echo "sha256=$(sha256sum "$WHEEL" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
           echo "$NAME  $(sha256sum "$WHEEL" | cut -d' ' -f1)"
+
+      # actions/cache saves in a post step that is skipped when the job fails, so a build that
+      # compiles for hours and then trips a later assertion would keep nothing. Save explicitly.
+      - name: Save the bazel cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
 
       # The artifact is only the handoff between jobs. It expires, and it needs credentials to
       # fetch. The candidate prerelease below is the durable copy.
