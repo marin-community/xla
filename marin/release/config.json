@@ -5,5 +5,12 @@
   "nightly_index": "https://us-python.pkg.dev/ml-oss-artifacts-published/jax-public-nightly-artifacts-registry",
   "cuda_compute_capabilities": "sm_100",
   "bazel_jobs": 4,
-  "max_wheel_size_mb": 400
+  "max_wheel_size_mb": 400,
+  "validation": {
+    "gpu": "GB200",
+    "gpu_resource": "GB200x2",
+    "target_cluster": "cw-us-east-08a",
+    "cpu": 16,
+    "memory": "128GB"
+  }
 }

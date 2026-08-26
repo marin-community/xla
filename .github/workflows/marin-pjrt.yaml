@@ -2,8 +2,11 @@ name: Marin PJRT
 
 # Marin fork only. Every upstream XLA workflow is disabled in this fork. See marin/README.md.
 #
-# This builds the patched jax-cuda13-pjrt wheel and uploads it as a build artifact. Validation on
-# a GB200 and release publication come in a later change.
+# This builds the patched jax-cuda13-pjrt wheel and publishes it as an unvalidated candidate
+# prerelease. Nothing here validates the wheel, so Marin must not pin what this produces.
+#
+# marin-pjrt-promote.yaml takes a candidate from here, validates it on a GB200, and republishes the
+# same bytes as a release. It is dispatched by hand against a candidate tag, and it never compiles.
 
 on:
   push:
