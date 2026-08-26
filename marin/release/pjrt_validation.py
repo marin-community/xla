@@ -22,14 +22,20 @@ than one that is wrong but green:
   (``"Device kernel: lsa_size=..."``), which needs ``TF_CPP_MAX_VLOG_LEVEL``. XLA does not write it
   to a dump directory.
 
-The exercise therefore runs in a child process whose stderr this script captures, rather than
+The exercise therefore runs in child processes whose stderr this script captures, rather than
 trying to redirect the C++ runtime's stderr from inside the process that imported jax.
+
+It runs one child per GPU. Symmetric memory is registered per process, so a single process holding
+several devices never resolves the buffers and the device kernel silently declines. The children
+form a JAX distributed world through a coordinator on loopback, which is enough because the whole
+job is one Iris task on one node.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import urllib.parse
@@ -39,7 +45,15 @@ from pathlib import Path
 MARKER = "MARIN_XLA_PJRT_VALIDATION"
 RESULT_MARKER = "MARIN_RAGGED_RESULT"
 DEVICE_KERNEL_LOG_PATTERN = "Device kernel: lsa_size="
-DEVICE_KERNEL_FLAG = "--xla_gpu_experimental_ragged_all_to_all_use_device_kernel=true"
+# The device kernel is gated on more than its own flag. ragged_all_to_all_thunk.cc engages it only
+# when collective memory is present and both the source and destination buffers resolve through
+# FindSymmetricMemory. Ragged all-to-all defaults to COLLECTIVES_PRIVATE_MEMORY, where they never
+# do, so the mode has to be switched as well: symmetric memory is what the thunk's comment calls
+# "device-initiated collectives that run as device kernels".
+DEVICE_KERNEL_FLAGS = (
+    "--xla_gpu_experimental_ragged_all_to_all_use_device_kernel=true",
+    "--xla_gpu_ragged_all_to_all_mode=symmetric",
+)
 SIBLING_TAG = "cp312-cp312-manylinux_2_27_aarch64"
 PURE_TAG = "py3-none-manylinux_2_27_aarch64"
 
@@ -48,10 +62,23 @@ PURE_TAG = "py3-none-manylinux_2_27_aarch64"
 # rank-1 offset and size arrays, and shard_map to bind the axis name.
 EXERCISE = f'''
 import json
+import os
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+process_id = int(os.environ["MARIN_PROCESS_ID"])
+num_processes = int(os.environ["MARIN_NUM_PROCESSES"])
+
+# One device per process. Symmetric memory is registered per process, so a process holding both
+# devices leaves FindSymmetricMemory empty and the device kernel declines without saying so.
+jax.distributed.initialize(
+    coordinator_address=os.environ["MARIN_COORDINATOR"],
+    num_processes=num_processes,
+    process_id=process_id,
+    local_device_ids=[process_id],
+)
 
 AXIS = "ep"
 ROWS_PER_PEER = 512
@@ -59,12 +86,13 @@ WIDTH = 6144
 
 devices = jax.devices()
 n = len(devices)
-if n < 2:
-    raise SystemExit(f"need at least 2 devices, found {{n}}")
+if n != num_processes:
+    raise SystemExit(f"expected {{num_processes}} global devices, found {{n}}")
 
 mesh = jax.make_mesh((n,), (AXIS,), axis_types=(AxisType.Explicit,))
 rows = ROWS_PER_PEER * n
 counts = np.full((n, n), ROWS_PER_PEER, dtype=np.int32)
+# Every process builds the same operand from the same seed, then contributes its own shard.
 rng = np.random.default_rng(0)
 operand = rng.standard_normal((n * rows, WIDTH), dtype=np.float32)
 
@@ -84,19 +112,25 @@ def exchange(local):
         axis_name=AXIS,
     )
 
-sharded = jax.device_put(operand, NamedSharding(mesh, PartitionSpec(AXIS)))
+sharding = NamedSharding(mesh, PartitionSpec(AXIS))
+local_rows = slice(process_id * rows, (process_id + 1) * rows)
+sharded = jax.make_array_from_process_local_data(sharding, operand[local_rows], (n * rows, WIDTH))
 with jax.set_mesh(mesh):
     out = jax.jit(jax.shard_map(exchange, out_specs=PartitionSpec(AXIS)))(sharded)
     jax.block_until_ready(out)
 
-# Shard s sends its block r to shard r, which receives it at slot s.
+# Shard s sends its block r to shard r, which receives it at slot s. Compare this process's own
+# shard: the global array is not addressable from any single process.
 blocks = operand.reshape(n, n, ROWS_PER_PEER, WIDTH)
-expected = blocks.transpose(1, 0, 2, 3).reshape(n * rows, WIDTH)
+expected = blocks.transpose(1, 0, 2, 3).reshape(n * rows, WIDTH)[local_rows]
+actual = np.asarray(out.addressable_shards[0].data)
 print("{RESULT_MARKER} " + json.dumps({{
-    "correct": bool(np.array_equal(np.asarray(out), expected)),
+    "process_id": process_id,
+    "correct": bool(np.array_equal(actual, expected)),
     "device_count": int(jax.device_count()),
     "compute_capability": ".".join(str(p) for p in devices[0].compute_capability),
-}}, sort_keys=True))
+}}, sort_keys=True), flush=True)
+
 '''
 
 
@@ -138,6 +172,49 @@ def install_runtime(config: dict, wheel: Path, python: str) -> None:
     subprocess.run(["uv", "pip", "install", "--python", python, "--no-deps", "--reinstall", str(wheel)], check=True)
 
 
+def free_port() -> int:
+    """Reserve a loopback port for the JAX coordinator, then release it for JAX to bind."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def run_exercise(python: str, processes: int) -> tuple[str, list[dict]]:
+    """Run one exercise process per GPU and return their combined output and result records."""
+    environment = dict(
+        os.environ,
+        XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), *DEVICE_KERNEL_FLAGS))),
+        TF_CPP_MAX_VLOG_LEVEL="3",
+        MARIN_COORDINATOR=f"127.0.0.1:{free_port()}",
+        MARIN_NUM_PROCESSES=str(processes),
+    )
+    children = [
+        subprocess.Popen(  # noqa: S603 - our own interpreter and source
+            [python, "-c", EXERCISE],
+            env=dict(environment, MARIN_PROCESS_ID=str(index)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for index in range(processes)
+    ]
+    outputs = [child.communicate()[0] for child in children]
+    combined = "".join(outputs)
+    sys.stderr.write(combined)
+
+    failed = [index for index, child in enumerate(children) if child.returncode != 0]
+    if failed:
+        raise SystemExit(f"ragged all-to-all exercise failed in processes {failed}")
+
+    records = []
+    for output in outputs:
+        for line in output.splitlines():
+            index = line.find(RESULT_MARKER)
+            if index >= 0:
+                records.append(json.loads(line[index + len(RESULT_MARKER) :]))
+    return combined, records
+
+
 def command_validate(args: argparse.Namespace) -> None:
     config = json.loads(args.config.read_text())
     wheel = fetch_wheel(args.wheel_url, args.expect_sha256, Path(args.download_dir))
@@ -161,24 +238,12 @@ def command_validate(args: argparse.Namespace) -> None:
     if versions["jax-cuda13-pjrt"] != args.expect_version:
         raise SystemExit(f"installed {versions['jax-cuda13-pjrt']}, candidate is {args.expect_version}")
 
-    environment = dict(
-        os.environ,
-        XLA_FLAGS=" ".join(filter(None, (os.environ.get("XLA_FLAGS", ""), DEVICE_KERNEL_FLAG))),
-        TF_CPP_MAX_VLOG_LEVEL="3",
-    )
-    completed = subprocess.run([python, "-c", EXERCISE], env=environment, capture_output=True, text=True, check=False)
-    combined = completed.stdout + completed.stderr
-    sys.stderr.write(combined)
-    if completed.returncode != 0:
-        raise SystemExit(f"ragged all-to-all exercise failed with status {completed.returncode}")
-
-    record = None
-    for line in completed.stdout.splitlines():
-        index = line.find(RESULT_MARKER)
-        if index >= 0:
-            record = json.loads(line[index + len(RESULT_MARKER) :])
-    if record is None:
-        raise SystemExit("exercise produced no result record")
+    processes = config["validation"]["processes"]
+    combined, records = run_exercise(python, processes)
+    if len(records) != processes:
+        raise SystemExit(f"expected {processes} result records, got {len(records)}")
+    record = records[0]
+    correct = all(entry["correct"] for entry in records)
 
     engaged = DEVICE_KERNEL_LOG_PATTERN in combined
     result = {
@@ -190,13 +255,24 @@ def command_validate(args: argparse.Namespace) -> None:
         "nccl_version": versions["nvidia-nccl-cu13"],
         "compute_capability": record["compute_capability"],
         "device_count": record["device_count"],
-        "ragged_all_to_all_ok": record["correct"],
+        "ragged_all_to_all_ok": correct,
         "device_kernel_engaged": engaged,
-        "status": "passed" if (record["correct"] and engaged) else "failed",
+        "status": "passed" if (correct and engaged) else "failed",
     }
     print(f"{MARKER} {json.dumps(result, sort_keys=True)}", flush=True)
-    if result["status"] != "passed":
-        raise SystemExit("validation failed: " + ("device kernel did not engage" if record["correct"] else "incorrect"))
+    if not correct:
+        wrong = [entry["process_id"] for entry in records if not entry["correct"]]
+        raise SystemExit(f"validation failed: the ragged all-to-all result is wrong in processes {wrong}")
+    if not engaged:
+        # The thunk logs lsa_size before it decides, and logs a separate line when it declines, so
+        # these say how far it got. Without them "did not engage" costs a whole run to localize.
+        trace = [
+            line.strip()
+            for line in combined.splitlines()
+            if "lsa_size" in line or "Device kernel" in line or "SupportsDeviceComm" in line
+        ]
+        detail = "\n  ".join(trace) if trace else "the thunk logged nothing about lsa_size"
+        raise SystemExit(f"validation failed: device kernel did not engage\n  {detail}")
 
 
 def command_extract(args: argparse.Namespace) -> None:
