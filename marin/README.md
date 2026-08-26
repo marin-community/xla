@@ -16,16 +16,43 @@ gh api -X PUT repos/marin-community/xla/actions/workflows/<id>/disable
 
 ## CI
 
-`.github/workflows/marin-pjrt.yaml` runs on a push to `main`, or on demand. It has two jobs. The
-first checks the pairing and builds the wheel. The second publishes the wheel as a prerelease,
-tagged `marin-xla-pjrt-candidate-<sha12>`, together with a JSON file that records the fork commit,
-the upstream base, the jax pairing, and the SHA-256.
+Two workflows. Building is automatic. Promoting is not.
 
-The prerelease is the durable copy. The build artifact between the two jobs expires after 14 days
-and needs credentials, but a release asset stays, and anyone can fetch it by URL.
+`.github/workflows/marin-pjrt.yaml` runs on a push to `main`, or on demand. It builds the wheel,
+then publishes it as a prerelease tagged `marin-xla-pjrt-candidate-<sha12>`, together with a JSON
+record of the fork commit, the upstream base, the jax pairing, the filename and the SHA-256.
 
-A candidate is unvalidated. No GB200 has run these bytes, so Marin must not pin a candidate. There
-is no promotion step, and no validated release.
+`.github/workflows/marin-pjrt-promote.yaml` is dispatched by hand against one candidate tag:
+
+```sh
+gh workflow run marin-pjrt-promote.yaml --repo marin-community/xla \
+  -f candidate_tag=marin-xla-pjrt-candidate-<sha12>
+```
+
+It validates that candidate on a GB200 through Iris, then republishes the same bytes as
+`marin-xla-pjrt-<date>-<sha12>` with the manifest Marin pins from.
+
+The second workflow never compiles. Everything it needs is in the candidate record, so a promotion
+takes minutes. Keeping it out of the build matters here: a full build is about three and a half
+hours, the bazel cache for this repository is larger than GitHub retains, and a promotion tied to a
+build would therefore pay for a compile of bytes that already exist.
+
+A candidate is unvalidated. Marin must pin a promoted release, never a candidate.
+
+Validation is what makes that distinction mean something. A wheel that does not carry the change
+still passes a correctness test, and still benchmarks as a null result, so the gate checks that the
+device kernel actually started. The kernel is opt-in behind
+`--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` and reports only through an
+`XLA_VLOG_DEVICE(3)` line on stderr.
+
+Promotion writes `marin-xla-pjrt-manifest.json`. Its shape is a contract with
+`render_pjrt_release_toml` in Marin's `config/update-external.py`, which refuses a manifest that is
+not `released`, whose validation did not pass, that does not record the device kernel engaging, or
+that names another repository. Pin a release with:
+
+```sh
+uv run config/update-external.py --promote-pjrt-release marin-xla-pjrt-manifest.json
+```
 
 Marin's change compiles into the GPU PJRT plugin, so `jax-cuda13-pjrt` is the only wheel built here.
 It is built for `aarch64` and `sm_100` (GB200). The other three wheels are stock: install `jax`,
@@ -35,6 +62,14 @@ It is built for `aarch64` and `sm_100` (GB200). The other three wheels are stock
 
 The wheel version is `<jax_version>+marin.<xla_short_sha>`. PEP 440 ignores a local segment when the
 specifier has none, so this version satisfies the plugin's pin and still records the XLA commit.
+
+jax composes that version in two places, and they agree only when both `ML_WHEEL_GIT_HASH` and
+`ML_WHEEL_VERSION_SUFFIX` are set. `python_wheel.bzl` names the wheel and emits the `+` only when
+the hash is set. `build/build.py` globs the wheel out of `bazel-bin` afterwards and emits the `+`
+always. So the marker goes in the hash, which both truncate with `.lstrip('0')[:9]`, and the commit
+goes in the suffix, which neither truncates. `marin/build_pjrt.sh` composes the version the way both
+files will and refuses a build whose halves disagree, because the version is otherwise materialized
+only by the last action of a multi-hour compile.
 
 ## How to refresh onto a newer upstream
 
