@@ -964,7 +964,7 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
 
         const int64_t num_updates_per_replica =
             config_.num_total_updates / num_ranks;
-        const int32_t cta_count = device_kernel_cta_count(core_count);
+        const int32_t cta_count = DeviceKernelCtaCount(core_count);
         const PrimitiveType element_type = device_buffers[0].element_type;
 
         XLA_VLOG_DEVICE(3, state->device_ordinal)

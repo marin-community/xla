@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/stream_executor/command_buffer.h"
+#include "xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/memory_allocation.h"
@@ -190,7 +191,7 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // SM. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
-  static int32_t device_kernel_cta_count(int core_count) {
+  static int32_t DeviceKernelCtaCount(int core_count) {
     return std::max<int32_t>(kGridSmMultiplier * core_count,
                              kMinDeviceKernelCtaCount);
   }
@@ -198,14 +199,14 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    requirements.lsa_barrier_count = device_kernel_cta_count(core_count);
+    requirements.lsa_barrier_count = DeviceKernelCtaCount(core_count);
     return requirements;
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    const int32_t c = device_kernel_cta_count(core_count);
+    const int32_t c = DeviceKernelCtaCount(core_count);
     requirements.barrier_count = c;
     requirements.lsa_barrier_count = c;
     requirements.rail_gin_barrier_count = c;
@@ -244,13 +245,14 @@ class RaggedAllToAllThunk : public CollectiveThunk {
 
   // Floor on the launch grid so small shapes still get some parallelism.
   // The upper bound is derived from the executor's SM count at Prepare /
-  // Initialize / Run time via device_kernel_cta_count().
+  // Initialize / Run time via DeviceKernelCtaCount().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
   // Resident CTAs per SM for the device kernel's cooperative grid. With
   // 128-thread CTAs this is 1024 threads/SM; the in-kernel LSA barriers
   // require the whole grid resident, so the product must stay within the
   // architecture's thread- and CTA-residency limits.
-  static constexpr int32_t kGridSmMultiplier = 8;
+  static constexpr int32_t kGridSmMultiplier =
+      stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm;
 
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<se::StreamExecutor*,
