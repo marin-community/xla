@@ -7,20 +7,23 @@
 # jax-cuda13-plugin are consumed stock from the nightly index at JAX_VERSION.
 #
 # The built wheel must satisfy the stock plugin's exact `jax-cuda13-pjrt==<JAX_VERSION>` pin.
-# jax's build derives the version as `<base>.dev<ML_WHEEL_BUILD_DATE>+<ML_WHEEL_GIT_HASH>` under
-# ML_WHEEL_TYPE=custom, and PEP 440 ignores a local segment when the specifier has none, so
-# `0.11.2.dev20260824+marin.<sha12>` resolves against `==0.11.2.dev20260824`. Getting the date
-# wrong silently produces a wheel the plugin will refuse.
+# Under ML_WHEEL_TYPE=custom, jax derives the version as
+# `<base>.dev<ML_WHEEL_BUILD_DATE><ML_WHEEL_VERSION_SUFFIX>`, appending the suffix verbatim. PEP 440
+# ignores a local segment when the specifier has none, so `0.11.2.dev20260824+marin.<sha12>`
+# resolves against `==0.11.2.dev20260824`. Getting the date wrong silently produces a wheel the
+# plugin will refuse.
 #
-# usage: XLA_SOURCE=<path> JAX_COMMIT=<sha> JAX_WHEEL_BUILD_DATE=YYYYMMDD \
-#        MARIN_XLA_COMMIT=<sha> OUT_DIR=<path> [CUDA_COMPUTE_CAPABILITIES=sm_100] \
-#        [BAZEL_JOBS=4] build_pjrt.sh
+# usage: XLA_SOURCE=<path> JAX_COMMIT=<sha> JAX_VERSION=<version> JAX_WHEEL_BUILD_DATE=YYYYMMDD \
+#        MARIN_XLA_COMMIT=<sha> MARIN_EXPECT_VERSION=<version> OUT_DIR=<path> \
+#        [CUDA_COMPUTE_CAPABILITIES=sm_100] [BAZEL_JOBS=4] build_pjrt.sh
 set -euo pipefail
 
 XLA_SOURCE="${XLA_SOURCE:?set XLA_SOURCE (path to this XLA checkout)}"
 JAX_COMMIT="${JAX_COMMIT:?set JAX_COMMIT (jax revision to build against)}"
 JAX_WHEEL_BUILD_DATE="${JAX_WHEEL_BUILD_DATE:?set JAX_WHEEL_BUILD_DATE (YYYYMMDD of the sibling nightly)}"
+JAX_VERSION="${JAX_VERSION:?set JAX_VERSION (the sibling nightly generation)}"
 MARIN_XLA_COMMIT="${MARIN_XLA_COMMIT:?set MARIN_XLA_COMMIT (the fork tip being built)}"
+MARIN_EXPECT_VERSION="${MARIN_EXPECT_VERSION:?set MARIN_EXPECT_VERSION (the version the preflight computed)}"
 OUT_DIR="${OUT_DIR:?set OUT_DIR}"
 CUDA_COMPUTE_CAPABILITIES="${CUDA_COMPUTE_CAPABILITIES:-sm_100}"
 BAZEL_JOBS="${BAZEL_JOBS:-4}"
@@ -32,10 +35,21 @@ mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 # The local segment records the exact XLA tip the wheel was built from, so an installed wheel
-# names its own provenance without a manifest lookup. It goes in ML_WHEEL_VERSION_SUFFIX, not
-# ML_WHEEL_GIT_HASH: jax applies .lstrip('0')[:9] to the git hash, which cut
-# "marin.<sha12>" down to "marin.ad3" and produced a wheel the stock plugin would refuse.
+# names its own provenance without a manifest lookup.
+#
+# It goes in ML_WHEEL_VERSION_SUFFIX, not ML_WHEEL_GIT_HASH, because jax truncates the git hash
+# with .lstrip('0')[:9]. The suffix is not truncated, but python_wheel.bzl appends it verbatim and
+# emits the '+' only for the git hash, so this script owns the '+' that opens the local segment.
+#
+# Derive the suffix from the version the preflight already computed, rather than rebuilding the
+# string here, and refuse a build whose two halves disagree. The version is otherwise materialized
+# by the wheel-packaging action at the very end, so a mismatch costs an entire compile.
 SHORT_XLA="${MARIN_XLA_COMMIT:0:12}"
+VERSION_SUFFIX="${MARIN_EXPECT_VERSION#"$JAX_VERSION"}"
+if [ "$VERSION_SUFFIX" != "+marin.${SHORT_XLA}" ]; then
+  echo "expected ${JAX_VERSION}+marin.${SHORT_XLA}, but the preflight computed ${MARIN_EXPECT_VERSION}" >&2
+  exit 1
+fi
 
 work="${WORK_DIR:-$(mktemp -d)}"
 mkdir -p "$work"
@@ -67,7 +81,7 @@ python3 build/build.py build \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=custom \
   --bazel_options=--repo_env=ML_WHEEL_BUILD_DATE="$JAX_WHEEL_BUILD_DATE" \
-  --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="marin.${SHORT_XLA}" \
+  --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$VERSION_SUFFIX" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 

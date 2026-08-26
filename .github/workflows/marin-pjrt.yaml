@@ -111,11 +111,13 @@ jobs:
           OUT_DIR: ${{ github.workspace }}/dist
           WORK_DIR: ${{ runner.temp }}/build
           JAX_WHEEL_BUILD_DATE: ${{ steps.identity.outputs.jax_build_date }}
+          MARIN_EXPECT_VERSION: ${{ steps.identity.outputs.version }}
         run: |
           JAX_COMMIT=$(jq -r .jax_commit "$RELEASE_CONFIG")
+          JAX_VERSION=$(jq -r .jax_version "$RELEASE_CONFIG")
           BAZEL_JOBS=$(jq -r .bazel_jobs "$RELEASE_CONFIG")
           CUDA_COMPUTE_CAPABILITIES=$(jq -r .cuda_compute_capabilities "$RELEASE_CONFIG")
-          export JAX_COMMIT BAZEL_JOBS CUDA_COMPUTE_CAPABILITIES
+          export JAX_COMMIT JAX_VERSION BAZEL_JOBS CUDA_COMPUTE_CAPABILITIES
           bash marin/build_pjrt.sh
 
       - name: Identify the wheel
