@@ -11,6 +11,7 @@
     "gpu_resource": "GB200x2",
     "target_cluster": "cw-us-east-08a",
     "cpu": 16,
-    "memory": "128GB"
+    "memory": "128GB",
+    "processes": 2
   }
 }
