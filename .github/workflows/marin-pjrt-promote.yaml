@@ -188,6 +188,9 @@ jobs:
           python marin/release/pjrt_validation.py extract --log validation.log --output validation.json
           cat validation.json
 
+      # if: always() so a failed gate still keeps its log. The gate can also fail before writing
+      # one, though, and an error there would bury the real cause under a missing-file error.
+      # "Enforce the gate" above is what fails the job, so this step only has to carry evidence.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -195,7 +198,7 @@ jobs:
           path: |
             validation.json
             validation.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
 
   promote:
