@@ -143,11 +143,17 @@ jobs:
           JOB_NAME: xla-pjrt-${{ github.run_id }}-${{ github.run_attempt }}
         # --exclude keeps XLA's source tree out of the workspace bundle, which Iris caps at 25MB.
         # The wheel is fetched by URL inside the job for the same reason: it is far past that cap.
+        #
+        # --no-sync skips Iris's own dependency setup. That setup runs `uv sync` in the bundle, and
+        # XLA is not a Python project, so it fails with "No `pyproject.toml` found" before the
+        # command runs. Nothing is lost: pjrt_validation.py installs the sibling generation and the
+        # candidate wheel itself, which is the whole point of the exercise.
         run: |
           JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
           echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
           set -o pipefail
           iris --cluster marin job run \
+            --no-sync \
             --target-cluster "$(jq -r .validation.target_cluster "$RELEASE_CONFIG")" \
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
