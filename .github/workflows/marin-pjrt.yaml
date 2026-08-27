@@ -1,0 +1,226 @@
+name: Marin PJRT
+
+# Marin fork only. Every upstream XLA workflow is disabled in this fork. See marin/README.md.
+#
+# This builds the patched jax-cuda13-pjrt wheel and publishes it as an unvalidated candidate
+# prerelease. Nothing here validates the wheel, so Marin must not pin what this produces.
+#
+# marin-pjrt-promote.yaml takes a candidate from here, validates it on a GB200, and republishes the
+# same bytes as a release. It is dispatched by hand against a candidate tag, and it never compiles.
+
+on:
+  push:
+    branches: [main]
+    # A cold build is three and a half hours, so do not start one for a change that cannot reach
+    # the wheel. Promotion runs from a published candidate in its own workflow, so its files and
+    # the documentation change without rebuilding anything.
+    paths-ignore:
+      - "marin/README.md"
+      - "marin/release/pjrt_validation.py"
+      - "marin/release/pjrt_promote.py"
+      - ".github/workflows/marin-pjrt-promote.yaml"
+  workflow_dispatch: {}
+
+concurrency:
+  # A fixed group, so a second push queues behind the first instead of starting another multi-hour
+  # ARM build. A per-commit group would serialize nothing.
+  group: marin-pjrt
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_CONFIG: marin/release/config.json
+
+jobs:
+  build:
+    name: Build the PJRT wheel
+    runs-on: ubuntu-24.04-arm
+    # GitHub caps hosted jobs at 6h whatever this says. The risk is a cold XLA and jaxlib CUDA
+    # compile. At a fixed base every later build is a warm incremental, because the change is four
+    # files. If a cold build does not fit, seed the bazel cache from one Iris run.
+    timeout-minutes: 355
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      upstream_base: ${{ steps.identity.outputs.upstream_base }}
+      candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
+      wheel_name: ${{ steps.wheel.outputs.name }}
+      wheel_sha256: ${{ steps.wheel.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history. merge-base below needs it, and a shallow checkout gives a wrong base
+          # without saying so.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Preflight the pairing
+        id: identity
+        # merge-base, not a local ancestry test, identifies the most recent upstream commit under
+        # the overlay. An overlay rebased onto a newer upstream tip still holds the pinned commit
+        # as an ancestor, so only merge-base shows that the base moved.
+        run: |
+          git remote add upstream https://github.com/openxla/xla.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/openxla/xla.git
+          git fetch --quiet --no-tags upstream main
+          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+          echo "upstream base: ${UPSTREAM_BASE}"
+
+          # The build script is only read after the toolchain and cache steps, so a syntax error
+          # in it otherwise surfaces minutes in. Parse it here instead.
+          bash -n marin/build_pjrt.sh
+
+          python marin/release/pjrt_release.py \
+            --config "$RELEASE_CONFIG" \
+            --fork-commit "$GITHUB_SHA" \
+            --base "$UPSTREAM_BASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "upstream_base=${UPSTREAM_BASE}"
+            echo "candidate_tag=marin-xla-pjrt-candidate-$(git rev-parse --short=12 "$GITHUB_SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim runner disk and add swap
+        # Bazel's link steps use more memory than the runner has, and the agent dies without a log.
+        # Free disk, and add swap to cover the peaks.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h /
+          free -h
+
+      - name: Install the host toolchain
+        # Bazel gets CUDA itself. It needs a local clang on aarch64.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+          clang --version
+
+      - name: Restore the bazel cache
+        id: bazel-cache
+        continue-on-error: true   # a cache fault must not fail the build
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-aarch64-${{ github.sha }}
+          restore-keys: bazel-aarch64-
+
+      - name: Build
+        env:
+          XLA_SOURCE: ${{ github.workspace }}
+          MARIN_XLA_COMMIT: ${{ github.sha }}
+          OUT_DIR: ${{ github.workspace }}/dist
+          WORK_DIR: ${{ runner.temp }}/build
+          JAX_WHEEL_BUILD_DATE: ${{ steps.identity.outputs.jax_build_date }}
+          MARIN_EXPECT_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          JAX_COMMIT=$(jq -r .jax_commit "$RELEASE_CONFIG")
+          JAX_VERSION=$(jq -r .jax_version "$RELEASE_CONFIG")
+          BAZEL_JOBS=$(jq -r .bazel_jobs "$RELEASE_CONFIG")
+          CUDA_COMPUTE_CAPABILITIES=$(jq -r .cuda_compute_capabilities "$RELEASE_CONFIG")
+          export JAX_COMMIT JAX_VERSION BAZEL_JOBS CUDA_COMPUTE_CAPABILITIES
+          bash marin/build_pjrt.sh
+
+      - name: Identify the wheel
+        id: wheel
+        run: |
+          WHEEL=$(ls dist/jax_cuda13_pjrt-*.whl)
+          NAME=$(basename "$WHEEL")
+          # A wrong build date makes a wheel that the stock plugin refuses. Find that here.
+          case "$NAME" in
+            *"${{ steps.identity.outputs.version }}"*) ;;
+            *) echo "$NAME does not carry ${{ steps.identity.outputs.version }}" >&2; exit 1 ;;
+          esac
+          MAX_MB=$(jq -r .max_wheel_size_mb "$RELEASE_CONFIG")
+          SIZE_MB=$(( $(stat -c%s "$WHEEL") / 1048576 ))
+          [ "$SIZE_MB" -le "$MAX_MB" ] || { echo "wheel is ${SIZE_MB}MB, over ${MAX_MB}MB" >&2; exit 1; }
+          {
+            echo "name=${NAME}"
+            echo "sha256=$(sha256sum "$WHEEL" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+          echo "$NAME  $(sha256sum "$WHEEL" | cut -d' ' -f1)"
+
+      # actions/cache saves in a post step that is skipped when the job fails, so a build that
+      # compiles for hours and then trips a later assertion would keep nothing. Save explicitly.
+      - name: Save the bazel cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/bazel
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+
+      # The artifact is only the handoff between jobs. It expires, and it needs credentials to
+      # fetch. The candidate prerelease below is the durable copy.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marin-xla-pjrt-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  publish_candidate:
+    name: Publish the candidate prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only this job writes. The multi-hour build job stays read-only.
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+      WHEEL_NAME: ${{ needs.build.outputs.wheel_name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-wheel
+          path: candidate
+
+      - name: Verify the bytes and describe them
+        run: |
+          echo "${WHEEL_SHA256}  candidate/${WHEEL_NAME}" | sha256sum --check --strict
+          jq -n \
+            --arg tag "$CANDIDATE_TAG" \
+            --arg fork_commit "${{ github.sha }}" \
+            --arg upstream_base "${{ needs.build.outputs.upstream_base }}" \
+            --arg jax_commit "$(jq -r .jax_commit "$RELEASE_CONFIG")" \
+            --arg jax_version "$(jq -r .jax_version "$RELEASE_CONFIG")" \
+            --arg version "${{ needs.build.outputs.version }}" \
+            --arg filename "$WHEEL_NAME" \
+            --arg sha256 "$WHEEL_SHA256" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{candidate_tag: $tag, run_url: $run_url,
+              source: {fork_commit: $fork_commit, upstream_base: $upstream_base},
+              jax: {commit: $jax_commit, version: $jax_version},
+              wheel: {filename: $filename, sha256: $sha256, version: $version,
+                      architecture: "aarch64", sm_targets: ["10.0"]}}' \
+            > candidate/marin-xla-pjrt-candidate.json
+          cat candidate/marin-xla-pjrt-candidate.json
+
+      - name: Publish once
+        # A candidate names one commit, so republishing it would mean two different sets of bytes
+        # under one tag. Refuse instead.
+        run: |
+          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing candidate $CANDIDATE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "Candidate ${CANDIDATE_TAG##*-}" \
+            --notes "Unvalidated build of \`${{ github.sha }}\`. No GB200 validation has run against these bytes, so Marin must not pin them. SHA-256 \`${WHEEL_SHA256}\`." \
+            candidate/*.whl candidate/*.json
