@@ -84,11 +84,21 @@ jobs:
 
           FORK_COMMIT=$(jq -r .source.fork_commit "$RECORD")
 
-          # Creating the release tags FORK_COMMIT, and GitHub refuses that outright when the
-          # resolved target commit differs from the default branch under .github/workflows/:
-          # "The GITHUB_TOKEN available to GitHub Actions cannot be authorized for this."
-          # No permissions block can grant it. Say so here rather than let `gh release create`
-          # fail later with a bare 403 that names none of this.
+          # Creating the release tags FORK_COMMIT. GitHub's create-release documentation says a
+          # token needs the workflow permission "when the resolved target commit modifies workflow
+          # files", and that "the GITHUB_TOKEN available to GitHub Actions cannot be authorized for
+          # this". No permissions block grants it.
+          #
+          # What resolves that condition is not documented precisely. Observed twice: a candidate
+          # whose commit differed from the default branch under .github/workflows/ was refused,
+          # and one identical to the default branch published. That commit did not modify workflow
+          # files in its own diff, so the comparison below is a proxy for GitHub's rule rather than
+          # a restatement of it, and it may also be standing in for something else the two cases
+          # share, such as the target not being a branch tip.
+          #
+          # It is worth checking anyway: `gh release create` reports only "HTTP 403: Resource not
+          # accessible by integration", while the job logs "Contents: write" and read a release
+          # successfully a step earlier.
           DRIFT=$(gh api "repos/$GITHUB_REPOSITORY/compare/${FORK_COMMIT}...${DEFAULT_BRANCH}" \
             --jq '[.files[]? | select(.filename | startswith(".github/workflows/")) | .filename]')
           if [ "$(echo "$DRIFT" | jq 'length')" -gt 0 ]; then
@@ -96,9 +106,12 @@ jobs:
             echo "${DEFAULT_BRANCH} in these workflow files:" >&2
             echo "$DRIFT" | jq -r '.[] | "  " + .' >&2
             echo "" >&2
-            echo "GITHUB_TOKEN cannot create a release tagging such a commit. Either build a" >&2
-            echo "candidate from the current ${DEFAULT_BRANCH} tip, or publish this release by" >&2
-            echo "hand with a token holding the workflow scope." >&2
+            echo "Tagging such a commit has been refused with HTTP 403 rather than published." >&2
+            echo "Either build a candidate from the current ${DEFAULT_BRANCH} tip, or publish this" >&2
+            echo "release by hand with a token holding the workflow scope." >&2
+            echo "" >&2
+            echo "If this refusal looks wrong, it is a proxy rather than GitHub's own rule: check" >&2
+            echo "https://docs.github.com/en/rest/releases/releases#create-a-release" >&2
             exit 1
           fi
           WHEEL_NAME=$(jq -r .wheel.filename "$RECORD")
