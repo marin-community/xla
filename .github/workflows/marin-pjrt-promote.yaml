@@ -1,0 +1,312 @@
+name: Marin PJRT promote
+
+# Marin fork only. Every upstream XLA workflow is disabled in this fork. See marin/README.md.
+#
+# marin-pjrt.yaml builds a wheel and publishes it as an unvalidated candidate prerelease. This
+# workflow takes one such candidate, proves on a GB200 that its XLA change is live, then
+# republishes the same bytes as a release carrying the manifest Marin pins from.
+#
+# It never compiles. Everything it needs about the wheel is already in the candidate record the
+# prerelease carries, so a promotion costs minutes and cannot be held up by a cold bazel cache.
+# That separation is the point: this repository's cache is larger than GitHub retains, so a
+# promotion tied to a build would pay a multi-hour compile for bytes that already exist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: "Candidate prerelease tag, e.g. marin-xla-pjrt-candidate-f373b302b417"
+        required: true
+        type: string
+
+concurrency:
+  # Per candidate. Two different candidates may promote at once; one candidate may not.
+  group: marin-pjrt-promote-${{ inputs.candidate_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_CONFIG: marin/release/config.json
+  CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  describe:
+    name: Read the candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      fork_commit: ${{ steps.candidate.outputs.fork_commit }}
+      release_tag: ${{ steps.candidate.outputs.release_tag }}
+      version: ${{ steps.candidate.outputs.version }}
+      wheel_name: ${{ steps.candidate.outputs.wheel_name }}
+      wheel_sha256: ${{ steps.candidate.outputs.wheel_sha256 }}
+      wheel_url: ${{ steps.candidate.outputs.wheel_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Read the candidate record
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern marin-xla-pjrt-candidate.json --dir candidate
+          RECORD=candidate/marin-xla-pjrt-candidate.json
+          cat "$RECORD"
+
+          # The record names its own tag. A mismatch means the asset was attached to some other
+          # release, so the bytes under this tag are not the ones the record describes.
+          RECORDED_TAG=$(jq -r .candidate_tag "$RECORD")
+          if [ "$RECORDED_TAG" != "$CANDIDATE_TAG" ]; then
+            echo "the candidate record names $RECORDED_TAG, not $CANDIDATE_TAG" >&2
+            exit 1
+          fi
+
+          # This workflow runs from whatever ref it was dispatched on, which may pin a different
+          # jax generation than the candidate was built against. The manifest takes its jax fields
+          # from the config, so a disagreement would publish a release naming a pairing that never
+          # existed. The build job cannot hit this, because it builds and publishes on one ref.
+          for field in commit version; do
+            recorded=$(jq -r ".jax.${field}" "$RECORD")
+            pinned=$(jq -r ".jax_${field}" "$RELEASE_CONFIG")
+            if [ "$recorded" != "$pinned" ]; then
+              echo "candidate was built against jax_${field} ${recorded}, but this ref pins ${pinned}" >&2
+              exit 1
+            fi
+          done
+
+          FORK_COMMIT=$(jq -r .source.fork_commit "$RECORD")
+
+          # Creating the release tags FORK_COMMIT. GitHub's create-release documentation says a
+          # token needs the workflow permission "when the resolved target commit modifies workflow
+          # files", and that "the GITHUB_TOKEN available to GitHub Actions cannot be authorized for
+          # this". No permissions block grants it.
+          #
+          # What resolves that condition is not documented precisely. Observed twice: a candidate
+          # whose commit differed from the default branch under .github/workflows/ was refused,
+          # and one identical to the default branch published. That commit did not modify workflow
+          # files in its own diff, so the comparison below is a proxy for GitHub's rule rather than
+          # a restatement of it, and it may also be standing in for something else the two cases
+          # share, such as the target not being a branch tip.
+          #
+          # It is worth checking anyway: `gh release create` reports only "HTTP 403: Resource not
+          # accessible by integration", while the job logs "Contents: write" and read a release
+          # successfully a step earlier.
+          DRIFT=$(gh api "repos/$GITHUB_REPOSITORY/compare/${FORK_COMMIT}...${DEFAULT_BRANCH}" \
+            --jq '[.files[]? | select(.filename | startswith(".github/workflows/")) | .filename]')
+          if [ "$(echo "$DRIFT" | jq 'length')" -gt 0 ]; then
+            echo "candidate ${CANDIDATE_TAG} was built from ${FORK_COMMIT}, which differs from" >&2
+            echo "${DEFAULT_BRANCH} in these workflow files:" >&2
+            echo "$DRIFT" | jq -r '.[] | "  " + .' >&2
+            echo "" >&2
+            echo "Tagging such a commit has been refused with HTTP 403 rather than published." >&2
+            echo "Either build a candidate from the current ${DEFAULT_BRANCH} tip, or publish this" >&2
+            echo "release by hand with a token holding the workflow scope." >&2
+            echo "" >&2
+            echo "If this refusal looks wrong, it is a proxy rather than GitHub's own rule: check" >&2
+            echo "https://docs.github.com/en/rest/releases/releases#create-a-release" >&2
+            exit 1
+          fi
+          WHEEL_NAME=$(jq -r .wheel.filename "$RECORD")
+
+          # The release tag dates the commit the wheel came from, matching what the build job would
+          # have produced. Read the date from the API rather than the checkout, because the
+          # dispatched ref need not contain that commit.
+          COMMIT_DATE=$(gh api "repos/$GITHUB_REPOSITORY/commits/$FORK_COMMIT" \
+            --jq '.commit.committer.date[0:10]' | tr -d -)
+
+          # Percent-encode the '+' in the version, as a release asset URL does.
+          ENCODED=$(python -c "import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=''))" "$WHEEL_NAME")
+
+          {
+            echo "fork_commit=${FORK_COMMIT}"
+            echo "release_tag=marin-xla-pjrt-${COMMIT_DATE}-${FORK_COMMIT:0:12}"
+            echo "version=$(jq -r .wheel.version "$RECORD")"
+            echo "wheel_name=${WHEEL_NAME}"
+            echo "wheel_sha256=$(jq -r .wheel.sha256 "$RECORD")"
+            echo "wheel_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${CANDIDATE_TAG}/${ENCODED}"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate on GB200
+    needs: describe
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token WIF exchanges for github-iris
+    env:
+      JOB_USER: xla-ci
+      WHEEL_URL: ${{ needs.describe.outputs.wheel_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.21"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        run: |
+          uv tool install --prerelease allow marin-core
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Run the hardware gate
+        id: iris
+        continue-on-error: true
+        env:
+          JOB_NAME: xla-pjrt-${{ github.run_id }}-${{ github.run_attempt }}
+        # --exclude keeps XLA's source tree out of the workspace bundle, which Iris caps at 25MB.
+        # The wheel is fetched by URL inside the job for the same reason: it is far past that cap.
+        #
+        # --no-sync skips Iris's own dependency setup. That setup runs `uv sync` in the bundle, and
+        # XLA is not a Python project, so it fails with "No `pyproject.toml` found" before the
+        # command runs. Nothing is lost: pjrt_validation.py installs the sibling generation and the
+        # candidate wheel itself, which is the whole point of the exercise.
+        run: |
+          JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
+          echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
+          set -o pipefail
+          iris --cluster marin job run \
+            --no-sync \
+            --target-cluster "$(jq -r .validation.target_cluster "$RELEASE_CONFIG")" \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --gpu "$(jq -r .validation.gpu_resource "$RELEASE_CONFIG")" --enable-extra-resources \
+            --cpu "$(jq -r .validation.cpu "$RELEASE_CONFIG")" \
+            --memory "$(jq -r .validation.memory "$RELEASE_CONFIG")" \
+            --disk 200GB \
+            --priority interactive \
+            --max-retries 0 \
+            --timeout 2400 \
+            --exclude '^(xla|third_party|docs)/' \
+            -- uv run --no-project --python 3.12 python \
+              marin/release/pjrt_validation.py validate \
+              --config "$RELEASE_CONFIG" \
+              --architecture aarch64 \
+              --hardware "$(jq -r .validation.gpu "$RELEASE_CONFIG")" \
+              --wheel-url "$WHEEL_URL" \
+              --expect-sha256 "${{ needs.describe.outputs.wheel_sha256 }}" \
+              --expect-version "${{ needs.describe.outputs.version }}" 2>&1 | tee validation.log
+
+      - name: Stop any Iris job left behind
+        if: always()
+        run: |
+          if [[ -n "${JOB_NAME:-}" ]]; then
+            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+          fi
+
+      - name: Enforce the gate
+        # Ahead of extract, so a failed Iris run reports its own error rather than "no record found".
+        run: |
+          if [[ "${{ steps.iris.outcome }}" != "success" ]]; then
+            echo "Iris validation failed; see validation.log" >&2
+            exit 1
+          fi
+
+      - name: Extract the validation record
+        run: |
+          python marin/release/pjrt_validation.py extract --log validation.log --output validation.json
+          cat validation.json
+
+      # if: always() so a failed gate still keeps its log. The gate can also fail before writing
+      # one, though, and an error there would bury the real cause under a missing-file error.
+      # "Enforce the gate" above is what fails the job, so this step only has to carry evidence.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-xla-pjrt-validation
+          path: |
+            validation.json
+            validation.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  promote:
+    name: Promote the validated candidate
+    needs: [describe, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.describe.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-xla-pjrt-validation
+          path: validation
+
+      - name: Collect the exact candidate bytes
+        run: |
+          mkdir release
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir release
+          echo "${{ needs.describe.outputs.wheel_sha256 }}  release/${{ needs.describe.outputs.wheel_name }}" \
+            | sha256sum --check --strict
+
+      - name: Render the release manifest
+        run: |
+          python marin/release/pjrt_promote.py \
+            --config "$RELEASE_CONFIG" \
+            --candidate release/marin-xla-pjrt-candidate.json \
+            --validation validation/validation.json \
+            --release-tag "$RELEASE_TAG" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output release/marin-xla-pjrt-manifest.json
+          rm release/marin-xla-pjrt-candidate.json
+          {
+            echo "Validated on $(jq -r .hardware validation/validation.json),"
+            echo "$(jq -r .device_count validation/validation.json) devices."
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${{ needs.describe.outputs.version }}\` |"
+            echo "| SHA-256 | \`${{ needs.describe.outputs.wheel_sha256 }}\` |"
+            echo "| Device kernel engaged | $(jq -r .device_kernel_engaged validation/validation.json) |"
+            echo "| Promoted from | \`$CANDIDATE_TAG\` |"
+            echo
+            echo "Pin it in Marin with:"
+            echo
+            echo '```'
+            echo "uv run config/update-external.py --promote-pjrt-release marin-xla-pjrt-manifest.json"
+            echo '```'
+          } > release/release-notes.md
+
+      - name: Publish once
+        # The release targets the commit the wheel was built from, not the ref this was dispatched
+        # on. They are the same only when a promotion happens to run from the fork tip.
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ needs.describe.outputs.fork_commit }}" \
+            --title "Marin XLA PJRT ${RELEASE_TAG#marin-xla-pjrt-}" \
+            --notes-file release/release-notes.md \
+            release/*.whl release/marin-xla-pjrt-manifest.json
