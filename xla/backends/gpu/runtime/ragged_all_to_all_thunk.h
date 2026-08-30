@@ -205,6 +205,19 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // through this function, so launch and registration stay consistent. The
   // value must be identical on every participating rank.
   static int32_t DeviceKernelCtaCount(int core_count) {
+    // XLA_RAGGED_A2A_DK_CTAS_TOTAL sets the grid to an absolute CTA count and takes precedence
+    // over the per-SM knob, which cannot express a grid below one CTA per SM. At these message
+    // sizes the copy is link-bound rather than SM-bound, so the useful grid can be far smaller
+    // than the device's SM count; this knob is what measures where that bottoms out. Values below
+    // kMinDeviceKernelCtaCount are clamped to it.
+    static const int32_t absolute = [] {
+      const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_TOTAL");
+      const int parsed = env == nullptr ? 0 : std::atoi(env);
+      return parsed >= 1 ? std::max<int32_t>(parsed, kMinDeviceKernelCtaCount) : 0;
+    }();
+    if (absolute > 0) {
+      return absolute;
+    }
     static const int32_t multiplier = [] {
       const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_PER_SM");
       const int parsed = env == nullptr ? 0 : std::atoi(env);
