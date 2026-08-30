@@ -19,6 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -195,8 +196,23 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // SM. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
+  // XLA_RAGGED_A2A_DK_CTAS_PER_SM (1..kGridSmMultiplier, default
+  // kGridSmMultiplier) caps the per-SM CTA count so the kernel's resident
+  // register and thread footprint can be traded against copy bandwidth when
+  // the transport overlaps compute. The balanced copy is grid-size-agnostic,
+  // the launch is a regular (non-cooperative) one so a smaller grid is
+  // trivially resident, and every barrier and signal registration routes
+  // through this function, so launch and registration stay consistent. The
+  // value must be identical on every participating rank.
   static int32_t DeviceKernelCtaCount(int core_count) {
-    return std::max<int32_t>(kGridSmMultiplier * core_count,
+    static const int32_t multiplier = [] {
+      const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_PER_SM");
+      const int parsed = env == nullptr ? 0 : std::atoi(env);
+      return (parsed >= 1 && parsed <= kGridSmMultiplier)
+                 ? parsed
+                 : kGridSmMultiplier;
+    }();
+    return std::max<int32_t>(multiplier * core_count,
                              kMinDeviceKernelCtaCount);
   }
 
