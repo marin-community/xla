@@ -30,16 +30,40 @@ class GpuDeviceCommunicator;
 
 namespace stream_executor::gpu {
 
-// Launch shape of the device kernel. The thunk sizes its grid to
-// kRaggedAllToAllDeviceKernelCtasPerSm CTAs per SM, and the in-kernel
-// cross-rank barriers deadlock unless the whole grid is resident at once.
-// The kernel's __launch_bounds__ passes kRaggedAllToAllDeviceKernelCtasPerSm
-// as minBlocksPerMultiprocessor, so the register allocator must preserve
-// that residency (64 registers/thread at 8x128 on a 64K-register SM).
+// BENCH BRANCH ONLY. Not for upstream.
+//
+// The launch geometry and the CTA assignment are selected at run time so that a
+// single wheel can measure every cell of the geometry x assignment matrix in one
+// interleaved session. Placement variance across sessions is larger than some of
+// the deltas we are trying to resolve, so the cells have to be drawn against each
+// other rather than compared across builds.
+//
+// Geometry is a compile-time property of the kernel, because __launch_bounds__
+// fixes both the block size and the register budget. Two instantiations cover the
+// three geometries: kStock reproduces upstream (512-thread CTAs, no
+// minBlocksPerMultiprocessor, so up to 128 registers/thread), while kNarrow and
+// kWide share the 128-thread instantiation whose launch bounds cap registers at
+// 64/thread and differ only in the grid the thunk launches.
+inline constexpr int kRaggedAllToAllStockThreadsPerCta = 512;
+inline constexpr int kRaggedAllToAllStockCtasPerSm = 1;
 inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 128;
 inline constexpr int kRaggedAllToAllDeviceKernelCtasPerSm = 8;
 
-template <int64_t kVectorSize>
+enum class RaggedAllToAllGeometry {
+  kStock,   // 512-thread CTAs; grid derived from the active update count.
+  kNarrow,  // 128-thread CTAs, one per SM.
+  kWide,    // 128-thread CTAs, kRaggedAllToAllDeviceKernelCtasPerSm per SM.
+};
+
+// How the LSA copy is spread over the grid. Passed as a kernel argument rather
+// than a template parameter: the branch is taken once per kernel, ahead of
+// multi-MB copies, so specializing it would only multiply instantiations.
+enum class RaggedAllToAllAssignment : int64_t {
+  kFixed = 0,     // Upstream: a fixed CTA count per update.
+  kBalanced = 1,  // Work-proportional: an equal element share per CTA.
+};
+
+template <int64_t kVectorSize, int kThreadsPerCta, int kCtasPerSm>
 struct RaggedAllToAllDeviceKernel {
   using KernelType = stream_executor::TypedKernel<
       xla::gpu::GpuDeviceCommunicator*,    // dev_comm
@@ -51,7 +75,8 @@ struct RaggedAllToAllDeviceKernel {
       int64_t,                             // num_updates_per_replica
       int64_t,                             // num_row_elements
       int64_t,                             // input_buffer_offset_bytes
-      int64_t>;                            // output_buffer_offset_bytes
+      int64_t,                             // output_buffer_offset_bytes
+      int64_t>;                            // assignment
 };
 
 }  // namespace stream_executor::gpu

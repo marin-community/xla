@@ -70,6 +70,126 @@ __device__ bool LoadRaggedAllToAllUpdateMetadata(
   return true;
 }
 
+// Upstream LSA assignment: a fixed number of CTAs per update, derived from the
+// update count alone and never from update sizes.
+template <int64_t kVectorSize>
+__device__ void RaggedAllToAllCopyLsaFixed(
+    ncclWindow_t send_win, ncclWindow_t recv_win,
+    const int64_t* __restrict__ input_offsets_ptr,
+    const int64_t* __restrict__ send_sizes_ptr,
+    const int64_t* __restrict__ output_offsets_ptr,
+    int64_t num_updates_per_replica, int64_t num_row_elements,
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    int start_lsa, int lsa_size) {
+  using T = DeviceVec<kVectorSize>;
+
+  const int grid = static_cast<int>(gridDim.x);
+  const int64_t total_lsa_updates =
+      static_cast<int64_t>(lsa_size) * num_updates_per_replica;
+  const int ctas_per_unit =
+      max(1, grid / static_cast<int>(total_lsa_updates));
+  const int unit_step = grid / ctas_per_unit;
+  const int my_unit_start = static_cast<int>(blockIdx.x) / ctas_per_unit;
+  const int my_cta_in_unit = static_cast<int>(blockIdx.x) % ctas_per_unit;
+  if (my_unit_start < total_lsa_updates) {
+    const int unit_tid = my_cta_in_unit * static_cast<int>(blockDim.x) +
+                         static_cast<int>(threadIdx.x);
+    const int unit_nthreads = ctas_per_unit * static_cast<int>(blockDim.x);
+
+    for (int unit = my_unit_start; unit < total_lsa_updates;
+         unit += unit_step) {
+      const int64_t flat_idx =
+          static_cast<int64_t>(start_lsa) * num_updates_per_replica + unit;
+      RaggedAllToAllUpdateMetadata<kVectorSize> meta;
+      if (!LoadRaggedAllToAllUpdateMetadata<kVectorSize>(
+              flat_idx, num_updates_per_replica, num_row_elements,
+              input_buffer_offset_bytes, output_buffer_offset_bytes,
+              input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
+        continue;
+      }
+
+      const int lsa_peer = unit / num_updates_per_replica;
+      const T* src = static_cast<const T*>(
+          ncclGetLocalPointer(send_win, meta.src_byte_offset));
+      T* dst = static_cast<T*>(
+          ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
+
+      const int64_t num_elements = meta.byte_count / kVectorSize;
+      for (int64_t i = unit_tid; i < num_elements; i += unit_nthreads) {
+        dst[i] = src[i];
+      }
+    }
+  }
+}
+
+// Work-proportional LSA assignment.
+template <int64_t kVectorSize>
+__device__ void RaggedAllToAllCopyLsaBalanced(
+    ncclWindow_t send_win, ncclWindow_t recv_win,
+    const int64_t* __restrict__ input_offsets_ptr,
+    const int64_t* __restrict__ send_sizes_ptr,
+    const int64_t* __restrict__ output_offsets_ptr,
+    int64_t num_updates_per_replica, int64_t num_row_elements,
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    int start_lsa, int lsa_size) {
+  using T = DeviceVec<kVectorSize>;
+
+  // Work-proportional CTA assignment: CTA k copies the global element range
+  // [total*k/grid, total*(k+1)/grid), walking update boundaries as needed.
+  // This keeps CTA work balanced regardless of how transferred bytes are
+  // distributed across updates. Every CTA redundantly scans the (small)
+  // update-size array; the loads hit L2 and the scan is trivially cheap
+  // next to the multi-MB copies. Updates are walked in peer-major order, so
+  // adjacent CTAs write to adjacent peers.
+  const int64_t grid = static_cast<int64_t>(gridDim.x);
+  const int64_t num_lsa_updates =
+      static_cast<int64_t>(lsa_size) * num_updates_per_replica;
+  const int64_t meta_base =
+      static_cast<int64_t>(start_lsa) * num_updates_per_replica;
+
+  int64_t total_elements = 0;
+  for (int64_t update = 0; update < num_lsa_updates; ++update) {
+    total_elements += send_sizes_ptr[meta_base + update] * num_row_elements;
+  }
+
+  const int64_t cta_begin =
+      total_elements * static_cast<int64_t>(blockIdx.x) / grid;
+  const int64_t cta_end =
+      total_elements * (static_cast<int64_t>(blockIdx.x) + 1) / grid;
+
+  // Element offset of the current update within the concatenated element
+  // space that cta_begin/cta_end index into.
+  int64_t update_begin = 0;
+  for (int64_t update = 0;
+       update < num_lsa_updates && update_begin < cta_end; ++update) {
+    RaggedAllToAllUpdateMetadata<kVectorSize> meta;
+    if (!LoadRaggedAllToAllUpdateMetadata<kVectorSize>(
+            meta_base + update, num_updates_per_replica, num_row_elements,
+            input_buffer_offset_bytes, output_buffer_offset_bytes,
+            input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
+      continue;
+    }
+    const int64_t update_end = update_begin + meta.byte_count / kVectorSize;
+    if (update_end > cta_begin) {
+      const int64_t lo =
+          cta_begin > update_begin ? cta_begin - update_begin : 0;
+      const int64_t hi =
+          (cta_end < update_end ? cta_end : update_end) - update_begin;
+      const int lsa_peer =
+          static_cast<int>(update / num_updates_per_replica);
+      const T* src = static_cast<const T*>(
+          ncclGetLocalPointer(send_win, meta.src_byte_offset));
+      T* dst = static_cast<T*>(
+          ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
+      for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
+           i += static_cast<int64_t>(blockDim.x)) {
+        dst[i] = src[i];
+      }
+    }
+    update_begin = update_end;
+  }
+}
+
 template <int64_t kVectorSize>
 __device__ void RaggedAllToAllCopy(
     ncclWindow_t send_win, ncclWindow_t recv_win,
@@ -79,63 +199,23 @@ __device__ void RaggedAllToAllCopy(
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
     int start_lsa, int lsa_size, int num_ranks, ncclGin* gin, ncclTeam world,
-    unsigned int signal_index) {
+    unsigned int signal_index, int64_t assignment) {
   using T = DeviceVec<kVectorSize>;
 
   if (lsa_size > 0) {
-    // Work-proportional CTA assignment: CTA k copies the global element range
-    // [total*k/grid, total*(k+1)/grid), walking update boundaries as needed.
-    // This keeps CTA work balanced regardless of how transferred bytes are
-    // distributed across updates. Every CTA redundantly scans the (small)
-    // update-size array; the loads hit L2 and the scan is trivially cheap
-    // next to the multi-MB copies. Updates are walked in peer-major order, so
-    // adjacent CTAs write to adjacent peers.
-    const int64_t grid = static_cast<int64_t>(gridDim.x);
-    const int64_t num_lsa_updates =
-        static_cast<int64_t>(lsa_size) * num_updates_per_replica;
-    const int64_t meta_base =
-        static_cast<int64_t>(start_lsa) * num_updates_per_replica;
-
-    int64_t total_elements = 0;
-    for (int64_t update = 0; update < num_lsa_updates; ++update) {
-      total_elements += send_sizes_ptr[meta_base + update] * num_row_elements;
-    }
-
-    const int64_t cta_begin =
-        total_elements * static_cast<int64_t>(blockIdx.x) / grid;
-    const int64_t cta_end =
-        total_elements * (static_cast<int64_t>(blockIdx.x) + 1) / grid;
-
-    // Element offset of the current update within the concatenated element
-    // space that cta_begin/cta_end index into.
-    int64_t update_begin = 0;
-    for (int64_t update = 0;
-         update < num_lsa_updates && update_begin < cta_end; ++update) {
-      RaggedAllToAllUpdateMetadata<kVectorSize> meta;
-      if (!LoadRaggedAllToAllUpdateMetadata<kVectorSize>(
-              meta_base + update, num_updates_per_replica, num_row_elements,
-              input_buffer_offset_bytes, output_buffer_offset_bytes,
-              input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
-        continue;
-      }
-      const int64_t update_end = update_begin + meta.byte_count / kVectorSize;
-      if (update_end > cta_begin) {
-        const int64_t lo =
-            cta_begin > update_begin ? cta_begin - update_begin : 0;
-        const int64_t hi =
-            (cta_end < update_end ? cta_end : update_end) - update_begin;
-        const int lsa_peer =
-            static_cast<int>(update / num_updates_per_replica);
-        const T* src = static_cast<const T*>(
-            ncclGetLocalPointer(send_win, meta.src_byte_offset));
-        T* dst = static_cast<T*>(
-            ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
-        for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
-             i += static_cast<int64_t>(blockDim.x)) {
-          dst[i] = src[i];
-        }
-      }
-      update_begin = update_end;
+    if (assignment ==
+        static_cast<int64_t>(RaggedAllToAllAssignment::kBalanced)) {
+      RaggedAllToAllCopyLsaBalanced<kVectorSize>(
+          send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
+          output_offsets_ptr, num_updates_per_replica, num_row_elements,
+          input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
+          lsa_size);
+    } else {
+      RaggedAllToAllCopyLsaFixed<kVectorSize>(
+          send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
+          output_offsets_ptr, num_updates_per_replica, num_row_elements,
+          input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
+          lsa_size);
     }
   }
 
@@ -167,16 +247,20 @@ __device__ void RaggedAllToAllCopy(
   }
 }
 
-template <int64_t kVectorSize>
-__global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
-                                  kRaggedAllToAllDeviceKernelCtasPerSm)
+// kCtasPerSm reaches __launch_bounds__ as minBlocksPerMultiprocessor, which is
+// what fixes the register budget: 64/thread at (128, 8), 128/thread at (512, 1).
+// (512, 1) is equivalent to upstream's bare __launch_bounds__(512), since a
+// 512-thread block is already only launchable at <=128 registers/thread.
+template <int64_t kVectorSize, int kThreadsPerCta, int kCtasPerSm>
+__global__ void __launch_bounds__(kThreadsPerCta, kCtasPerSm)
     RaggedAllToAllDeviceKernelImpl(
     struct ncclDevComm dev_comm, ncclWindow_t send_win, ncclWindow_t recv_win,
     const int64_t* __restrict__ input_offsets_ptr,
     const int64_t* __restrict__ send_sizes_ptr,
     const int64_t* __restrict__ output_offsets_ptr,
     int64_t num_updates_per_replica, int64_t num_row_elements,
-    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    int64_t assignment) {
   // NCCL device barrier/GIN APIs emit scope-qualified atomics that require
   // sm_60+. Lower architectures compile to an empty stub; the kernel is only
   // launched when the device supports NCCL device comms.
@@ -205,7 +289,7 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
         output_offsets_ptr, num_updates_per_replica, num_row_elements,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
-        lsa_size, num_ranks, &gin, world, signal_index);
+        lsa_size, num_ranks, &gin, world, signal_index, assignment);
 
     const int num_remote_peers =
         (num_ranks - lsa_size) * num_updates_per_replica;
@@ -226,7 +310,8 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
         output_offsets_ptr, num_updates_per_replica, num_row_elements,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
-        lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
+        lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0,
+        assignment);
 
     bar.sync(ncclCoopCta(), ::cuda::memory_order_release);
   }
@@ -235,13 +320,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
 
 #else  // NCCL_VERSION_CODE < 22900
 
-template <int64_t kVectorSize>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCtasPerSm>
 __global__ void RaggedAllToAllDeviceKernelImpl(
     void* dev_comm, void* send_win, void* recv_win,
     const int64_t* input_offsets_ptr, const int64_t* send_sizes_ptr,
     const int64_t* output_offsets_ptr, int64_t num_updates_per_replica,
     int64_t num_row_elements, int64_t input_buffer_offset_bytes,
-    int64_t output_buffer_offset_bytes) {}
+    int64_t output_buffer_offset_bytes, int64_t assignment) {}
 
 #endif  // NCCL_VERSION_CODE >= 22900
 

@@ -74,6 +74,14 @@ if ! grep -q "std::max<int32_t>(core_count, kMinDeviceKernelCtaCount)" \
   echo "XLA checkout does not carry the ragged a2a device-kernel grid delta." >&2
   exit 1
 fi
+# BENCH BRANCH ONLY. The matrix switch is the whole point of this wheel, and a wheel that lost it
+# still builds, still validates and still benchmarks -- as whichever cell the defaults name. That
+# is indistinguishable from a real null result, so check the switch is compiled in.
+if ! grep -q "MARIN_RA2A_GEOMETRY" \
+    "$XLA_SOURCE/xla/backends/gpu/runtime/ragged_all_to_all_thunk.h"; then
+  echo "XLA checkout does not carry the ragged a2a geometry/assignment matrix switch." >&2
+  exit 1
+fi
 
 cd "$jax_dir"
 python3 build/build.py build \

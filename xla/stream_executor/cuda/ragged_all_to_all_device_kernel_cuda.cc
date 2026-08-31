@@ -22,21 +22,35 @@ limitations under the License.
 
 #define SINGLE_ARG(...) __VA_ARGS__
 
-#define REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(VECTOR_SIZE)                 \
+// BENCH BRANCH ONLY. Both launch geometries are registered so the thunk can
+// pick one per run. NAME must differ per (vector size, geometry) pair: the
+// registry keys on the trait type, and the loader spec keys on the symbol name.
+#define REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(NAME, VECTOR_SIZE, THREADS,  \
+                                                 CTAS_PER_SM)                 \
   GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(                             \
-      RaggedAllToAllDeviceKernelCuda##VECTOR_SIZE##Bytes,                     \
-      SINGLE_ARG(                                                             \
-          stream_executor::gpu::RaggedAllToAllDeviceKernel<VECTOR_SIZE>),     \
+      RaggedAllToAllDeviceKernelCuda##NAME,                                   \
+      SINGLE_ARG(stream_executor::gpu::RaggedAllToAllDeviceKernel<            \
+                 VECTOR_SIZE, THREADS, CTAS_PER_SM>),                         \
       stream_executor::cuda::kCudaPlatformId, ([](size_t arity) {             \
         return stream_executor::KernelLoaderSpec::CreateInProcessSymbolSpec(  \
             absl::bit_cast<void*>(&SINGLE_ARG(                                \
                 stream_executor::gpu::RaggedAllToAllDeviceKernelImpl<         \
-                    VECTOR_SIZE>)),                                           \
-            "ragged_all_to_all_device_kernel_" #VECTOR_SIZE "_bytes", arity); \
+                    VECTOR_SIZE, THREADS, CTAS_PER_SM>)),                     \
+            "ragged_all_to_all_device_kernel_" #NAME, arity);                 \
       }));
 
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(1);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(2);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(4);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(8);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(16);
+#define REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(VECTOR_SIZE)      \
+  REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(                                   \
+      VECTOR_SIZE##BytesNarrow, VECTOR_SIZE,                                  \
+      stream_executor::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta,         \
+      stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm)             \
+  REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(                                   \
+      VECTOR_SIZE##BytesStock, VECTOR_SIZE,                                   \
+      stream_executor::gpu::kRaggedAllToAllStockThreadsPerCta,                \
+      stream_executor::gpu::kRaggedAllToAllStockCtasPerSm)
+
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(1);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(2);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(4);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(8);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(16);

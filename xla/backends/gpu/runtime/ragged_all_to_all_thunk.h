@@ -19,6 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -27,6 +28,8 @@ limitations under the License.
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -186,6 +189,47 @@ class RaggedAllToAllThunk : public CollectiveThunk {
     return config_.use_device_kernel && config_.config.use_symmetric_buffer;
   }
 
+  // BENCH BRANCH ONLY. Selects the launch geometry and the LSA CTA assignment
+  // from the environment, once per process, so one wheel can draw every cell of
+  // the matrix in a single interleaved session:
+  //
+  //   MARIN_RA2A_GEOMETRY   = stock | narrow | wide     (default narrow)
+  //   MARIN_RA2A_ASSIGNMENT = fixed | balanced          (default balanced)
+  //
+  // The default pair is the fork tip. stock+fixed is upstream. Read once into a
+  // static: the barrier registration at Prepare/Initialize has to describe the
+  // same grid that Run launches, so the value must not change under the process.
+  static se::gpu::RaggedAllToAllGeometry DeviceKernelGeometry() {
+    static const se::gpu::RaggedAllToAllGeometry geometry = [] {
+      const char* v = std::getenv("MARIN_RA2A_GEOMETRY");
+      if (v == nullptr) return se::gpu::RaggedAllToAllGeometry::kNarrow;
+      if (absl::string_view(v) == "stock") {
+        return se::gpu::RaggedAllToAllGeometry::kStock;
+      }
+      if (absl::string_view(v) == "wide") {
+        return se::gpu::RaggedAllToAllGeometry::kWide;
+      }
+      CHECK_EQ(absl::string_view(v), "narrow")
+          << "MARIN_RA2A_GEOMETRY must be stock, narrow or wide";
+      return se::gpu::RaggedAllToAllGeometry::kNarrow;
+    }();
+    return geometry;
+  }
+
+  static se::gpu::RaggedAllToAllAssignment DeviceKernelAssignment() {
+    static const se::gpu::RaggedAllToAllAssignment assignment = [] {
+      const char* v = std::getenv("MARIN_RA2A_ASSIGNMENT");
+      if (v == nullptr) return se::gpu::RaggedAllToAllAssignment::kBalanced;
+      if (absl::string_view(v) == "fixed") {
+        return se::gpu::RaggedAllToAllAssignment::kFixed;
+      }
+      CHECK_EQ(absl::string_view(v), "balanced")
+          << "MARIN_RA2A_ASSIGNMENT must be fixed or balanced";
+      return se::gpu::RaggedAllToAllAssignment::kBalanced;
+    }();
+    return assignment;
+  }
+
   // Launch grid for the device kernel, and the number of per-CTA
   // barrier/signal slots reserved when creating the device communicator (the
   // kernel indexes its barriers by blockIdx.x, so registration must cover the
@@ -199,17 +243,60 @@ class RaggedAllToAllThunk : public CollectiveThunk {
     return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
   }
 
+  // Upstream's grid: ctas_per_update * num_active_updates, capped at the SM
+  // count. Restored here so the stock cell is the real control rather than a
+  // constant-grid approximation of it.
+  static int32_t DeviceKernelStockCtaCount(int core_count,
+                                           int64_t num_active_updates) {
+    const int64_t sm_cap = std::max<int64_t>(1, core_count);
+    const int64_t updates = std::max<int64_t>(1, num_active_updates);
+    const int64_t ctas_per_update = std::max<int64_t>(1, sm_cap / updates);
+    const int64_t grid = ctas_per_update * updates;
+    return static_cast<int32_t>(
+        std::clamp<int64_t>(grid, kMinDeviceKernelCtaCount, sm_cap));
+  }
+
+  static int32_t DeviceKernelLaunchCtaCount(int core_count,
+                                            int64_t num_active_updates) {
+    switch (DeviceKernelGeometry()) {
+      case se::gpu::RaggedAllToAllGeometry::kStock:
+        return DeviceKernelStockCtaCount(core_count, num_active_updates);
+      case se::gpu::RaggedAllToAllGeometry::kNarrow:
+        return DeviceKernelCtaCount(core_count);
+      case se::gpu::RaggedAllToAllGeometry::kWide:
+        return std::max<int32_t>(
+            stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm *
+                core_count,
+            kMinDeviceKernelCtaCount);
+    }
+    LOG(FATAL) << "unreachable geometry";
+  }
+
+  // Registration must cover the largest grid the selected geometry can launch.
+  // Sized per geometry rather than at the maximum across all three: registering
+  // 8x the barriers while running the stock grid would change what NCCL
+  // allocates, and so would perturb the very cell it is the control for.
+  static int32_t DeviceKernelBarrierCount(int core_count) {
+    if (DeviceKernelGeometry() == se::gpu::RaggedAllToAllGeometry::kWide) {
+      return std::max<int32_t>(
+          stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm *
+              core_count,
+          kMinDeviceKernelCtaCount);
+    }
+    return DeviceKernelCtaCount(core_count);
+  }
+
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    requirements.lsa_barrier_count = DeviceKernelCtaCount(core_count);
+    requirements.lsa_barrier_count = DeviceKernelBarrierCount(core_count);
     return requirements;
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    const int32_t c = DeviceKernelCtaCount(core_count);
+    const int32_t c = DeviceKernelBarrierCount(core_count);
     requirements.barrier_count = c;
     requirements.lsa_barrier_count = c;
     requirements.rail_gin_barrier_count = c;

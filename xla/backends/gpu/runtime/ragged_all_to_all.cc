@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -215,26 +216,51 @@ absl::Status RunRaggedAllToAllWithSymmetricMemoryKernel(
 
 namespace {
 
-template <int64_t kVectorSize>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCtasPerSm>
 absl::Status LaunchDeviceKernel(
     se::Stream* stream, se::StreamExecutor* executor,
-    const se::ThreadDim& thread_dims, const se::BlockDim& block_dims,
+    const se::BlockDim& block_dims,
     xla::gpu::GpuDeviceCommunicator* dev_comm, xla::SymmetricMemory* send_win,
     xla::SymmetricMemory* recv_win, se::DeviceAddressBase input_offsets_buffer,
     se::DeviceAddressBase send_sizes_buffer,
     se::DeviceAddressBase output_offsets_buffer,
     int64_t num_updates_per_replica, int64_t num_row_elements,
-    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
-  using KernelTrait = se::gpu::RaggedAllToAllDeviceKernel<kVectorSize>;
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    se::gpu::RaggedAllToAllAssignment assignment) {
+  using KernelTrait =
+      se::gpu::RaggedAllToAllDeviceKernel<kVectorSize, kThreadsPerCta,
+                                          kCtasPerSm>;
 
   ABSL_ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()
                                     .LoadKernel<KernelTrait>(executor));
 
+  // The block size is the geometry's own kThreadsPerCta, not a caller argument:
+  // it has to agree with the __launch_bounds__ the kernel was compiled under.
+  se::ThreadDim thread_dims(kThreadsPerCta, 1, 1);
   return kernel.Launch(thread_dims, block_dims, stream, dev_comm, send_win,
                        recv_win, input_offsets_buffer, send_sizes_buffer,
                        output_offsets_buffer, num_updates_per_replica,
                        num_row_elements, input_buffer_offset_bytes,
-                       output_buffer_offset_bytes);
+                       output_buffer_offset_bytes,
+                       static_cast<int64_t>(assignment));
+}
+
+// Dispatch a runtime geometry onto its compile-time instantiation. kNarrow and
+// kWide share one: they differ only in the grid the thunk sizes, not in the
+// kernel's block size or register budget.
+template <int64_t kVectorSize, typename... Args>
+absl::Status LaunchDeviceKernelForGeometry(
+    se::gpu::RaggedAllToAllGeometry geometry, Args&&... args) {
+  if (geometry == se::gpu::RaggedAllToAllGeometry::kStock) {
+    return LaunchDeviceKernel<kVectorSize,
+                              se::gpu::kRaggedAllToAllStockThreadsPerCta,
+                              se::gpu::kRaggedAllToAllStockCtasPerSm>(
+        std::forward<Args>(args)...);
+  }
+  return LaunchDeviceKernel<
+      kVectorSize, se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta,
+      se::gpu::kRaggedAllToAllDeviceKernelCtasPerSm>(
+      std::forward<Args>(args)...);
 }
 
 }  // namespace
@@ -247,13 +273,10 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     se::DeviceAddressBase output_offsets_buffer, int64_t num_ranks,
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t cta_count, int64_t input_buffer_offset_bytes,
-    int64_t output_buffer_offset_bytes) {
+    int64_t output_buffer_offset_bytes,
+    se::gpu::RaggedAllToAllGeometry geometry,
+    se::gpu::RaggedAllToAllAssignment assignment) {
   se::StreamExecutor* executor = stream->parent();
-  // The copies are latency-bound peer stores, so throughput scales with
-  // concurrent CTAs rather than threads per CTA: many small CTAs across the
-  // grid RaggedAllToAllThunk sizes.
-  static constexpr size_t kThreadsPerCta =
-      se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
@@ -263,15 +286,14 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     vector_size_bytes *= 2;
   }
 
-  se::ThreadDim thread_dims(kThreadsPerCta, 1, 1);
   se::BlockDim block_dims(cta_count, 1, 1);
 
   auto launch = [&](auto type) -> absl::Status {
-    return LaunchDeviceKernel<decltype(type)::value>(
-        stream, executor, thread_dims, block_dims, dev_comm, send_win, recv_win,
+    return LaunchDeviceKernelForGeometry<decltype(type)::value>(
+        geometry, stream, executor, block_dims, dev_comm, send_win, recv_win,
         input_offsets_buffer, send_sizes_buffer, output_offsets_buffer,
         num_updates_per_replica, num_vectorized_row_elements,
-        input_buffer_offset_bytes, output_buffer_offset_bytes);
+        input_buffer_offset_bytes, output_buffer_offset_bytes, assignment);
   };
 
   switch (vector_size_bytes) {

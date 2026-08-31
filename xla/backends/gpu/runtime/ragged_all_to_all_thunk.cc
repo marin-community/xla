@@ -972,13 +972,19 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
 
         const int64_t num_updates_per_replica =
             config_.num_total_updates / num_ranks;
-        const int32_t cta_count = DeviceKernelCtaCount(core_count);
+        // Remote peers are reached via GIN puts; local peers via LSA copies.
+        const int64_t num_active_updates =
+            (gin ? num_ranks : lsa_size) * num_updates_per_replica;
+        const int32_t cta_count =
+            DeviceKernelLaunchCtaCount(core_count, num_active_updates);
         const PrimitiveType element_type = device_buffers[0].element_type;
 
         XLA_VLOG_DEVICE(3, state->device_ordinal)
             << "Device kernel: lsa_size=" << lsa_size
             << " num_ranks=" << num_ranks << " gin=" << gin
             << " cta_count=" << cta_count
+            << " geometry=" << static_cast<int>(DeviceKernelGeometry())
+            << " assignment=" << static_cast<int>(DeviceKernelAssignment())
             << " num_updates_per_replica=" << num_updates_per_replica
             << " num_row_elements=" << config_.num_row_elements
             << " element_type="
@@ -990,7 +996,8 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
             device_buffers[4].source_buffer, num_ranks, num_updates_per_replica,
             config_.num_row_elements, cta_count,
             static_cast<int64_t>(input_offset),
-            static_cast<int64_t>(output_offset));
+            static_cast<int64_t>(output_offset), DeviceKernelGeometry(),
+            DeviceKernelAssignment());
       }
     }
   }
