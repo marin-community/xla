@@ -156,6 +156,11 @@ RaggedAllToAllConfig GetRaggedAllToAllConfig(
           ->config()
           .debug_options()
           .xla_gpu_experimental_ragged_all_to_all_use_device_kernel();
+  config.device_kernel_ctas_per_sm =
+      instr->GetModule()
+          ->config()
+          .debug_options()
+          .xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm();
   config.allow_fallback_to_nccl =
       instr->GetModule()
           ->config()
@@ -890,6 +895,7 @@ RaggedAllToAllThunk::FromProto(
           thunk_proto.use_multi_gpu_barrier_with_nccl_in_one_shot_kernel(),
           thunk_proto.allow_fallback_to_nccl(), thunk_proto.collectives_mode(),
           thunk_proto.use_device_kernel(),
+          thunk_proto.device_kernel_ctas_per_sm(),
           fast_interconnect_slice_size_override},
       std::move(buffers));
 }
@@ -916,6 +922,8 @@ absl::StatusOr<ThunkProto> RaggedAllToAllThunk::ToProto() const {
   thunk_proto->set_allow_fallback_to_nccl(config_.allow_fallback_to_nccl);
   thunk_proto->set_collectives_mode(collectives_mode());
   thunk_proto->set_use_device_kernel(config_.use_device_kernel);
+  thunk_proto->set_device_kernel_ctas_per_sm(
+      config_.device_kernel_ctas_per_sm);
   thunk_proto->set_fast_interconnect_slice_size_override(
       config_.fast_interconnect_slice_size_override.value_or(0));
 
@@ -972,7 +980,8 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
 
         const int64_t num_updates_per_replica =
             config_.num_total_updates / num_ranks;
-        const int32_t cta_count = DeviceKernelCtaCount(core_count);
+        const int32_t cta_count =
+            DeviceKernelCtaCount(core_count, config_.device_kernel_ctas_per_sm);
         const PrimitiveType element_type = device_buffers[0].element_type;
 
         XLA_VLOG_DEVICE(3, state->device_ordinal)

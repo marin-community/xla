@@ -19,7 +19,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -79,6 +78,9 @@ struct RaggedAllToAllConfig {
   // If true, the thunk will use the device-initiated (NCCL GIN + LSA) kernel
   // for ragged-all-to-all when symmetric buffers are available.
   bool use_device_kernel = false;
+
+  // Resident CTAs per SM for the device kernel's grid; 0 keeps the default.
+  int32_t device_kernel_ctas_per_sm = 0;
 
   // If set, this will be used to determine if optimized kernels that assume a
   // fast interconnect can be used.
@@ -196,22 +198,19 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // SM. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
-  // XLA_RAGGED_A2A_DK_CTAS_PER_SM (1..kGridSmMultiplier, default
-  // kGridSmMultiplier) caps the per-SM CTA count so the kernel's resident
-  // register and thread footprint can be traded against copy bandwidth when
-  // the transport overlaps compute. The balanced copy is grid-size-agnostic,
-  // the launch is a regular (non-cooperative) one so a smaller grid is
-  // trivially resident, and every barrier and signal registration routes
-  // through this function, so launch and registration stay consistent. The
-  // value must be identical on every participating rank.
-  static int32_t DeviceKernelCtaCount(int core_count) {
-    static const int32_t multiplier = [] {
-      const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_PER_SM");
-      const int parsed = env == nullptr ? 0 : std::atoi(env);
-      return (parsed >= 1 && parsed <= kGridSmMultiplier)
-                 ? parsed
-                 : kGridSmMultiplier;
-    }();
+  // `ctas_per_sm` caps the per-SM CTA count so the kernel's resident register
+  // and thread footprint can be traded against copy bandwidth when the
+  // transport overlaps compute; 0 keeps `kGridSmMultiplier`. The balanced copy
+  // is grid-size-agnostic, the launch is a regular (non-cooperative) one so a
+  // smaller grid is trivially resident, and every barrier and signal
+  // registration routes through this function, so launch and registration stay
+  // consistent. The value comes from the module's debug options and travels in
+  // the thunk proto, so every rank executing one executable agrees on it.
+  static int32_t DeviceKernelCtaCount(int core_count, int32_t ctas_per_sm) {
+    const int32_t multiplier =
+        (ctas_per_sm >= 1 && ctas_per_sm <= kGridSmMultiplier)
+            ? ctas_per_sm
+            : kGridSmMultiplier;
     return std::max<int32_t>(multiplier * core_count,
                              kMinDeviceKernelCtaCount);
   }
@@ -219,14 +218,16 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    requirements.lsa_barrier_count = DeviceKernelCtaCount(core_count);
+    requirements.lsa_barrier_count =
+        DeviceKernelCtaCount(core_count, config_.device_kernel_ctas_per_sm);
     return requirements;
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    const int32_t c = DeviceKernelCtaCount(core_count);
+    const int32_t c =
+        DeviceKernelCtaCount(core_count, config_.device_kernel_ctas_per_sm);
     requirements.barrier_count = c;
     requirements.lsa_barrier_count = c;
     requirements.rail_gin_barrier_count = c;

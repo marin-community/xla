@@ -406,6 +406,7 @@ message RaggedAllToAllThunkProto {
   xla.DebugOptions.CollectivesMode collectives_mode = 12;
   bool use_device_kernel = 13;
   bool allow_fallback_to_nccl = 14;
+  int32 device_kernel_ctas_per_sm = 15;
 }
 
 message CollectivePermuteThunkProto {

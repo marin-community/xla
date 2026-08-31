@@ -556,6 +556,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_ragged_all_to_all_mode(
       DebugOptions::COLLECTIVES_PRIVATE_MEMORY);
   opts.set_xla_gpu_experimental_ragged_all_to_all_use_device_kernel(false);
+  opts.set_xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm(0);
   opts.set_xla_gpu_allow_ragged_all_to_all_nccl_send_recv_fallback(false);
   opts.set_xla_gpu_experimental_use_ragged_dot_grouped_gemm(true);
   opts.set_xla_gpu_native_emitter_tune_unroll_factor_for_loops(false);
@@ -3492,6 +3493,15 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_experimental_ragged_all_to_all_use_device_kernel(),
       "If true, use the device-initiated (NCCL GIN + LSA) kernel for "
       "ragged-all-to-all. Requires NCCL >= 2.29."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm",
+      int32_setter_for(
+          &DebugOptions::
+              set_xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm),
+      debug_options
+          ->xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm(),
+      "Resident CTAs per SM for the ragged-all-to-all device kernel's grid. 0 "
+      "keeps the kernel's own default."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_allow_ragged_all_to_all_nccl_send_recv_fallback",
       bool_setter_for(
