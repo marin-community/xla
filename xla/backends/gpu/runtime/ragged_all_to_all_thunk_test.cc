@@ -539,6 +539,7 @@ TEST(CollectiveThunkTest, ProtoRoundTrip) {
           num_input_rows: 2
           num_row_elements: 5
           one_shot_kernel_enabled: true
+          device_kernel_ctas_per_sm: 2
         }
       )pb");
 
@@ -558,6 +559,10 @@ TEST(CollectiveThunkTest, ProtoRoundTrip) {
   EXPECT_EQ(
       thunk->ragged_all_to_all_config().fast_interconnect_slice_size_override,
       std::nullopt);
+
+  // A proto3 int32 elides its zero, so a non-zero value here is what keeps a
+  // dropped ToProto or FromProto line from round-tripping clean.
+  EXPECT_EQ(thunk->ragged_all_to_all_config().device_kernel_ctas_per_sm, 2);
 
   ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
 

@@ -191,21 +191,22 @@ class RaggedAllToAllThunk : public CollectiveThunk {
 
   // Launch grid for the device kernel, and the number of per-CTA
   // barrier/signal slots reserved when creating the device communicator (the
-  // kernel indexes its cooperative barrier by blockIdx.x, so registration
-  // must cover the launched grid). All ranks launch the same grid, which the
-  // cross-rank cooperative barriers require: every CTA must be resident
-  // simultaneously, so the size is kGridSmMultiplier CTAs of 128 threads per
-  // SM. Callers pass the SM count from
+  // kernel indexes its barriers by blockIdx.x, so registration must cover the
+  // launched grid). The barriers are per-CTA and cross-rank, not a grid-wide
+  // device barrier, and the launch is a regular one, so a grid narrower than
+  // the device is trivially resident. Every rank must still launch the same
+  // grid, because a CTA waits on its counterpart of the same index on every
+  // peer. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
   // `ctas_per_sm` caps the per-SM CTA count so the kernel's resident register
   // and thread footprint can be traded against copy bandwidth when the
-  // transport overlaps compute; 0 keeps `kGridSmMultiplier`. The balanced copy
-  // is grid-size-agnostic, the launch is a regular (non-cooperative) one so a
-  // smaller grid is trivially resident, and every barrier and signal
-  // registration routes through this function, so launch and registration stay
-  // consistent. The value comes from the module's debug options and travels in
-  // the thunk proto, so every rank executing one executable agrees on it.
+  // transport overlaps compute; 0 keeps `kGridSmMultiplier`, as does any value
+  // above it. The balanced copy is grid-size-agnostic, and every barrier and
+  // signal registration routes through this function, so launch and
+  // registration stay consistent. The value comes from the module's debug
+  // options and travels in the thunk proto, so every rank executing one
+  // executable agrees on it.
   static int32_t DeviceKernelCtaCount(int core_count, int32_t ctas_per_sm) {
     const int32_t multiplier =
         (ctas_per_sm >= 1 && ctas_per_sm <= kGridSmMultiplier)
@@ -268,10 +269,10 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // The upper bound is derived from the executor's SM count at Prepare /
   // Initialize / Run time via DeviceKernelCtaCount().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
-  // Resident CTAs per SM for the device kernel's cooperative grid. With
-  // 128-thread CTAs this is 1024 threads/SM; the in-kernel LSA barriers
-  // require the whole grid resident, so the product must stay within the
-  // architecture's thread- and CTA-residency limits.
+  // Default resident CTAs per SM for the device kernel's grid. With 128-thread
+  // CTAs this is 1024 threads/SM, chosen to stay within the architecture's
+  // thread- and CTA-residency limits so the full grid is resident at once.
+  // `ctas_per_sm` may select a narrower grid.
   static constexpr int32_t kGridSmMultiplier =
       stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm;
 

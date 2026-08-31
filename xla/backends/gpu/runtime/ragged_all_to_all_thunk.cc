@@ -160,7 +160,7 @@ RaggedAllToAllConfig GetRaggedAllToAllConfig(
       instr->GetModule()
           ->config()
           .debug_options()
-          .xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm();
+          .xla_gpu_experimental_ragged_all_to_all_ctas_per_sm();
   config.allow_fallback_to_nccl =
       instr->GetModule()
           ->config()
