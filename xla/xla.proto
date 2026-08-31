@@ -1771,10 +1771,10 @@ message DebugOptions {
   optional bool xla_gpu_experimental_ragged_all_to_all_use_device_kernel = 521;
 
   // Resident CTAs per SM for the ragged-all-to-all device kernel's grid. 0
-  // keeps the kernel's own default. A smaller grid leaves SMs for compute that
-  // overlaps the transport, at some cost to the transport itself.
-  optional int32 xla_gpu_experimental_ragged_all_to_all_device_kernel_ctas_per_sm =
-      537;
+  // keeps the kernel's own default, as does any value above it or below 1. A
+  // smaller grid leaves SMs for compute that overlaps the transport, at some
+  // cost to the transport itself.
+  optional int32 xla_gpu_experimental_ragged_all_to_all_ctas_per_sm = 537;
 
   // If true, allow fallback to NCCL (Send/Recv or Put/Signal) path for
   // ragged-all-to-all.
