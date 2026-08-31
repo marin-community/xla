@@ -188,16 +188,15 @@ class RaggedAllToAllThunk : public CollectiveThunk {
 
   // Launch grid for the device kernel, and the number of per-CTA
   // barrier/signal slots reserved when creating the device communicator (the
-  // kernel indexes its cooperative barrier by blockIdx.x, so registration
-  // must cover the launched grid). All ranks launch the same grid, which the
-  // cross-rank cooperative barriers require: every CTA must be resident
-  // simultaneously, so the size is kGridSmMultiplier CTAs of 128 threads per
-  // SM. Callers pass the SM count from
+  // kernel indexes its barriers by blockIdx.x, so registration must cover the
+  // launched grid). One CTA per SM: the copies are link-bound at these message
+  // sizes, so a wider grid buys little transport latency, and the kernel holds
+  // its CTAs for the whole transport including the barrier spins, which starves
+  // compute scheduled against it. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
   static int32_t DeviceKernelCtaCount(int core_count) {
-    return std::max<int32_t>(kGridSmMultiplier * core_count,
-                             kMinDeviceKernelCtaCount);
+    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
@@ -251,12 +250,6 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // The upper bound is derived from the executor's SM count at Prepare /
   // Initialize / Run time via DeviceKernelCtaCount().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
-  // Resident CTAs per SM for the device kernel's cooperative grid. With
-  // 128-thread CTAs this is 1024 threads/SM; the in-kernel LSA barriers
-  // require the whole grid resident, so the product must stay within the
-  // architecture's thread- and CTA-residency limits.
-  static constexpr int32_t kGridSmMultiplier =
-      stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm;
 
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<se::StreamExecutor*,
