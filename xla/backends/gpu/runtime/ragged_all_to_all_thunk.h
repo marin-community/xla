@@ -19,6 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -204,10 +205,20 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // transport overlaps compute; 0 keeps `kGridSmMultiplier`, as does any value
   // above it. The balanced copy is grid-size-agnostic, and every barrier and
   // signal registration routes through this function, so launch and
-  // registration stay consistent. The value comes from the module's debug
-  // options and travels in the thunk proto, so every rank executing one
-  // executable agrees on it.
+  // registration stay consistent.
+  //
+  // The value normally comes from the module's debug options and travels in the
+  // thunk proto, so every rank executing one executable agrees on it. It falls
+  // back to XLA_RAGGED_A2A_DK_CTAS_PER_SM only because this repository ships
+  // the PJRT plugin alone against a stock jax and jaxlib: a client built from
+  // upstream rejects a fork-only entry in XLA_FLAGS before the plugin sees it,
+  // and its DebugOptions carries no field to hold the value. The environment is
+  // the only channel that reaches a plugin-only patch. Delete the fallback once
+  // the option exists in the client the plugin is loaded by.
   static int32_t DeviceKernelCtaCount(int core_count, int32_t ctas_per_sm) {
+    if (ctas_per_sm < 1 || ctas_per_sm > kGridSmMultiplier) {
+      ctas_per_sm = CtasPerSmFromEnv();
+    }
     const int32_t multiplier =
         (ctas_per_sm >= 1 && ctas_per_sm <= kGridSmMultiplier)
             ? ctas_per_sm
@@ -269,6 +280,16 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // The upper bound is derived from the executor's SM count at Prepare /
   // Initialize / Run time via DeviceKernelCtaCount().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
+
+  // Read once: the value is process-wide and must not change between the
+  // registration and the launch of a single execution.
+  static int32_t CtasPerSmFromEnv() {
+    static const int32_t value = [] {
+      const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_PER_SM");
+      return env == nullptr ? 0 : std::atoi(env);
+    }();
+    return value;
+  }
   // Default resident CTAs per SM for the device kernel's grid. With 128-thread
   // CTAs this is 1024 threads/SM, chosen to stay within the architecture's
   // thread- and CTA-residency limits so the full grid is resident at once.
