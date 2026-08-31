@@ -19,7 +19,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -79,9 +78,6 @@ struct RaggedAllToAllConfig {
   // If true, the thunk will use the device-initiated (NCCL GIN + LSA) kernel
   // for ragged-all-to-all when symmetric buffers are available.
   bool use_device_kernel = false;
-
-  // Resident CTAs per SM for the device kernel's grid; 0 keeps the default.
-  int32_t device_kernel_ctas_per_sm = 0;
 
   // If set, this will be used to determine if optimized kernels that assume a
   // fast interconnect can be used.
@@ -193,53 +189,27 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // Launch grid for the device kernel, and the number of per-CTA
   // barrier/signal slots reserved when creating the device communicator (the
   // kernel indexes its barriers by blockIdx.x, so registration must cover the
-  // launched grid). The barriers are per-CTA and cross-rank, not a grid-wide
-  // device barrier, and the launch is a regular one, so a grid narrower than
-  // the device is trivially resident. Every rank must still launch the same
-  // grid, because a CTA waits on its counterpart of the same index on every
-  // peer. Callers pass the SM count from
+  // launched grid). One CTA per SM: the copies are link-bound at these message
+  // sizes, so a wider grid buys little transport latency, and the kernel holds
+  // its CTAs for the whole transport including the barrier spins, which starves
+  // compute scheduled against it. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
-  // `ctas_per_sm` caps the per-SM CTA count so the kernel's resident register
-  // and thread footprint can be traded against copy bandwidth when the
-  // transport overlaps compute; 0 keeps `kGridSmMultiplier`, as does any value
-  // above it. The balanced copy is grid-size-agnostic, and every barrier and
-  // signal registration routes through this function, so launch and
-  // registration stay consistent.
-  //
-  // The value normally comes from the module's debug options and travels in the
-  // thunk proto, so every rank executing one executable agrees on it. It falls
-  // back to XLA_RAGGED_A2A_DK_CTAS_PER_SM only because this repository ships
-  // the PJRT plugin alone against a stock jax and jaxlib: a client built from
-  // upstream rejects a fork-only entry in XLA_FLAGS before the plugin sees it,
-  // and its DebugOptions carries no field to hold the value. The environment is
-  // the only channel that reaches a plugin-only patch. Delete the fallback once
-  // the option exists in the client the plugin is loaded by.
-  static int32_t DeviceKernelCtaCount(int core_count, int32_t ctas_per_sm) {
-    if (ctas_per_sm < 1 || ctas_per_sm > kGridSmMultiplier) {
-      ctas_per_sm = CtasPerSmFromEnv();
-    }
-    const int32_t multiplier =
-        (ctas_per_sm >= 1 && ctas_per_sm <= kGridSmMultiplier)
-            ? ctas_per_sm
-            : kGridSmMultiplier;
-    return std::max<int32_t>(multiplier * core_count,
-                             kMinDeviceKernelCtaCount);
+  static int32_t DeviceKernelCtaCount(int core_count) {
+    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    requirements.lsa_barrier_count =
-        DeviceKernelCtaCount(core_count, config_.device_kernel_ctas_per_sm);
+    requirements.lsa_barrier_count = DeviceKernelCtaCount(core_count);
     return requirements;
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelDevCommRequirements(
       int core_count) const {
     GpuDeviceCommunicator::Requirements requirements;
-    const int32_t c =
-        DeviceKernelCtaCount(core_count, config_.device_kernel_ctas_per_sm);
+    const int32_t c = DeviceKernelCtaCount(core_count);
     requirements.barrier_count = c;
     requirements.lsa_barrier_count = c;
     requirements.rail_gin_barrier_count = c;
@@ -280,22 +250,6 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // The upper bound is derived from the executor's SM count at Prepare /
   // Initialize / Run time via DeviceKernelCtaCount().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
-
-  // Read once: the value is process-wide and must not change between the
-  // registration and the launch of a single execution.
-  static int32_t CtasPerSmFromEnv() {
-    static const int32_t value = [] {
-      const char* env = std::getenv("XLA_RAGGED_A2A_DK_CTAS_PER_SM");
-      return env == nullptr ? 0 : std::atoi(env);
-    }();
-    return value;
-  }
-  // Default resident CTAs per SM for the device kernel's grid. With 128-thread
-  // CTAs this is 1024 threads/SM, chosen to stay within the architecture's
-  // thread- and CTA-residency limits so the full grid is resident at once.
-  // `ctas_per_sm` may select a narrower grid.
-  static constexpr int32_t kGridSmMultiplier =
-      stream_executor::gpu::kRaggedAllToAllDeviceKernelCtasPerSm;
 
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<se::StreamExecutor*,
