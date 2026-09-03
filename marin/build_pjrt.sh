@@ -75,6 +75,14 @@ if ! grep -q "std::max<int32_t>(core_count - reserved, kMinDeviceKernelCtaCount)
   exit 1
 fi
 
+# Compile the device kernels against the NCCL that Marin actually installs at run time.
+# tensorflow.bazelrc pins HERMETIC_NCCL_VERSION to 2.29.7 while lib/marin/pyproject.toml resolves
+# nvidia-nccl-cu13 to 2.30.7. NCCL supports that skew deliberately -- dev_runtime.cc guards the
+# compiled-versus-runtime version and deepCopyDevCommRequirements normalises the requirement
+# structs -- but the device-side API only grows in the newer headers, so the barrier timeout used
+# by the ragged all-to-all kernel is unavailable when building against 2.29.7.
+: "${HERMETIC_NCCL_VERSION:=2.30.7}"
+
 cd "$jax_dir"
 python3 build/build.py build \
   --wheels=jax-cuda-pjrt \
@@ -85,6 +93,7 @@ python3 build/build.py build \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
   --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$WHEEL_VERSION_SUFFIX" \
+  --bazel_options=--repo_env=HERMETIC_NCCL_VERSION="$HERMETIC_NCCL_VERSION" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 
