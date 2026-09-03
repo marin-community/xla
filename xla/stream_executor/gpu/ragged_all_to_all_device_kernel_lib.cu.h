@@ -167,6 +167,50 @@ __device__ void RaggedAllToAllCopy(
   }
 }
 
+// Reduces a per-thread barrier result to a CTA-uniform verdict.
+//
+// NCCL's timeout barriers report the timeout per thread: a thread whose share
+// of the peer loop is empty, or whose peers all arrived, returns ncclSuccess
+// even though a sibling thread gave up. (NCCL notes the same in
+// ncclBarrierSession::sync's timeout overload.) The whole CTA has to agree,
+// because leaving the barrier scope runs ~ncclLsaBarrierSession, which ends in
+// coop.sync() == __syncthreads(): a partial exit would hang the survivors.
+//
+// Safe to call here because every timeout overload ends in coop.sync(), so all
+// threads of the CTA reach this point together.
+__device__ inline bool RaggedAllToAllBarrierTimedOut(ncclResult_t result) {
+  return __syncthreads_or(result != ncclSuccess) != 0;
+}
+
+// Publishes the first barrier timeout seen on this device. See
+// ragged_all_to_all_device_kernel.h for the record layout.
+//
+// A timeout is terminal, not recoverable: NCCL's wait skips its epoch
+// increment on the timeout path, so the session destructor persists a stale
+// epoch and the barrier's shared state is left inconsistent for every
+// subsequent launch on that comm. The host is expected to fail the execution
+// once it observes a record rather than to retry.
+__device__ inline void RecordRaggedAllToAllBarrierTimeout(
+    uint64_t* __restrict__ record_ptr, uint64_t phase, int world_rank,
+    int lsa_rank) {
+  if (record_ptr == nullptr || threadIdx.x != 0) {
+    return;
+  }
+  const uint64_t record =
+      (kRaggedAllToAllBarrierTimeoutTag
+       << kRaggedAllToAllBarrierTimeoutTagShift) |
+      (phase << kRaggedAllToAllBarrierTimeoutPhaseShift) |
+      (static_cast<uint64_t>(lsa_rank & 0xFFFF)
+       << kRaggedAllToAllBarrierTimeoutLsaRankShift) |
+      (static_cast<uint64_t>(world_rank & 0xFFFF)
+       << kRaggedAllToAllBarrierTimeoutWorldRankShift) |
+      static_cast<uint64_t>(blockIdx.x & 0xFFFF);
+  // First writer wins, so the record names the CTA that stalled rather than the
+  // last one to notice.
+  atomicCAS(reinterpret_cast<unsigned long long*>(record_ptr), 0ULL,
+            static_cast<unsigned long long>(record));
+}
+
 template <int64_t kVectorSize>
 __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
                                   kRaggedAllToAllDeviceKernelCtasPerSm)
@@ -176,7 +220,9 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const int64_t* __restrict__ send_sizes_ptr,
     const int64_t* __restrict__ output_offsets_ptr,
     int64_t num_updates_per_replica, int64_t num_row_elements,
-    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    int64_t barrier_timeout_cycles,
+    uint64_t* __restrict__ barrier_timeout_record) {
   // NCCL device barrier/GIN APIs emit scope-qualified atomics that require
   // sm_60+. Lower architectures compile to an empty stub; the kernel is only
   // launched when the device supports NCCL device comms.
@@ -187,6 +233,11 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
   const int lsa_size = lsa.nRanks;
   const int num_ranks = world.nRanks;
   const bool has_remote_peers = (lsa_size < num_ranks);
+  // Budget for each individual barrier wait, in SM clock cycles. The host
+  // derives it from the device clock rate; see
+  // RaggedAllToAllThunk::DeviceKernelBarrierTimeoutCycles.
+  const uint64_t timeout_cycles =
+      static_cast<uint64_t>(barrier_timeout_cycles);
 
   if (has_remote_peers) {
     const int gin_context = 0;
@@ -198,8 +249,17 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
 
     ncclBarrierSession<ncclCoopCta> bar{ncclCoopCta(), ncclTeamTagWorld(), gin,
                                         blockIdx.x};
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_acquire,
-             ncclGinFenceLevel::Relaxed);
+    // NB: gin.waitSignal below has no timeout overload in NCCL, so the GIN
+    // path is only partially bounded. The reported stall (#8870) is on the
+    // pure-LSA path.
+    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_acquire,
+            ncclGinFenceLevel::Relaxed, timeout_cycles))) {
+      RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
+                                         kRaggedAllToAllBarrierPhasePreCopy,
+                                         world.rank, lsa.rank);
+      return;
+    }
 
     RaggedAllToAllCopy<kVectorSize>(
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
@@ -215,12 +275,24 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     }
 
     gin.flush(ncclCoopCta());
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_release,
-             ncclGinFenceLevel::Relaxed);
+    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_release,
+            ncclGinFenceLevel::Relaxed, timeout_cycles))) {
+      RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
+                                         kRaggedAllToAllBarrierPhasePostCopy,
+                                         world.rank, lsa.rank);
+      return;
+    }
   } else {
     ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), dev_comm,
                                            ncclTeamTagLsa{}, blockIdx.x};
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_relaxed);
+    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_relaxed, timeout_cycles))) {
+      RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
+                                         kRaggedAllToAllBarrierPhasePreCopy,
+                                         world.rank, lsa.rank);
+      return;
+    }
 
     RaggedAllToAllCopy<kVectorSize>(
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
@@ -228,7 +300,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
         lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
 
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_release);
+    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_release, timeout_cycles))) {
+      RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
+                                         kRaggedAllToAllBarrierPhasePostCopy,
+                                         world.rank, lsa.rank);
+      return;
+    }
   }
 #endif  // __CUDA_ARCH__ >= 600
 }
@@ -241,7 +319,8 @@ __global__ void RaggedAllToAllDeviceKernelImpl(
     const int64_t* input_offsets_ptr, const int64_t* send_sizes_ptr,
     const int64_t* output_offsets_ptr, int64_t num_updates_per_replica,
     int64_t num_row_elements, int64_t input_buffer_offset_bytes,
-    int64_t output_buffer_offset_bytes) {}
+    int64_t output_buffer_offset_bytes, int64_t barrier_timeout_cycles,
+    uint64_t* barrier_timeout_record) {}
 
 #endif  // NCCL_VERSION_CODE >= 22900
 

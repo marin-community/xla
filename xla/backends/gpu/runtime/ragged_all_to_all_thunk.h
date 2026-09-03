@@ -45,6 +45,7 @@ limitations under the License.
 #include "xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/util/tied_ref.h"
@@ -125,6 +126,20 @@ struct RaggedAllToAllStreamState {
   // Device memory buffer to store the output buffer pointers.
   std::unique_ptr<se::MemoryAllocation> output_buffer_ptr_storage;
 
+  // Device kernel barrier timeout diagnostics (see #8870). The kernel bounds
+  // its cross-rank barrier waits and, on expiry, publishes a single 64-bit
+  // record here naming the rank, the barrier slot and the barrier phase that
+  // stalled; the record is sticky for the life of the process. Allocated only
+  // on the device-kernel path.
+  se::ScopedDeviceAddress<uint8_t> barrier_timeout_record;
+
+  // Pinned host destination for the readback of `barrier_timeout_record`. The
+  // readback is enqueued after every device-kernel launch and never waited on,
+  // so the host copy lags the device by at least one launch. That is fine: a
+  // stalled barrier is sticky, and one aligned 64-bit word cannot be observed
+  // torn.
+  std::unique_ptr<se::MemoryAllocation> barrier_timeout_host_record;
+
   // Contains the output buffer pointers and barrier signal buffers for all
   // peers.
   std::shared_ptr<std::vector<RaggedAllToAllRendezvousValue>> participants;
@@ -197,6 +212,29 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // to be homogeneous so every rank arrives at the same value.
   static int32_t DeviceKernelCtaCount(int core_count) {
     return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
+  }
+
+  // Per-wait budget for the device kernel's cross-rank barriers, in SM clock
+  // cycles (what clock64() counts, and what NCCL's timeout barrier overloads
+  // compare against).
+  //
+  // Targets ~45s of wall time. That is far longer than any legitimate skew
+  // between ranks of one collective - the whole grid is co-resident and the
+  // peers are on the same NVLink domain - but short enough that a wedged
+  // collective reports itself well inside the job's watchdog window instead of
+  // hanging silently. The SM clock throttles, so the realised timeout is only
+  // ever longer than the target, never shorter.
+  static int64_t DeviceKernelBarrierTimeoutCycles(
+      const se::DeviceDescription& device_description) {
+    constexpr double kTargetSeconds = 45.0;
+    // clock_rate_ghz() is kUninitialized<float> (-1) on platforms that do not
+    // report it. Fall back to a deliberately high clock so the fallback errs
+    // towards a longer timeout rather than a spurious one.
+    constexpr double kFallbackClockGhz = 3.0;
+    const double clock_ghz = device_description.clock_rate_ghz() > 0.0f
+                                 ? device_description.clock_rate_ghz()
+                                 : kFallbackClockGhz;
+    return static_cast<int64_t>(kTargetSeconds * clock_ghz * 1e9);
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(

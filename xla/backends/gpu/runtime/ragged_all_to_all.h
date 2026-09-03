@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <variant>
 
 #include "absl/status/status.h"
@@ -83,7 +84,18 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     se::DeviceAddressBase output_offsets_buffer, int64_t num_ranks,
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t cta_count, int64_t input_buffer_offset_bytes,
-    int64_t output_buffer_offset_bytes);
+    int64_t output_buffer_offset_bytes, int64_t barrier_timeout_cycles,
+    se::DeviceAddressBase barrier_timeout_record);
+
+// Returns true if `record`, read back from the device kernel's barrier timeout
+// buffer, holds a timeout report. See the record layout in
+// xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h.
+bool HasRaggedAllToAllBarrierTimeout(uint64_t record);
+
+// Decodes a barrier timeout record into a human-readable description naming the
+// rank, the barrier slot (blockIdx.x) and the barrier phase that stalled.
+// Requires HasRaggedAllToAllBarrierTimeout(record).
+std::string FormatRaggedAllToAllBarrierTimeout(uint64_t record);
 
 }  // namespace xla::gpu
 

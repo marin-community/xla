@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +28,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/call_once.h"
 #include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
@@ -262,6 +264,34 @@ absl::Status LaunchMultiGpuBarrier(
                                          local_barrier_signal_value);
 }
 
+// Fails the execution if the device kernel published a barrier timeout record
+// (see #8870). The record is read from the pinned host copy filled by the
+// readback that the previous device-kernel launch enqueued, so it is at least
+// one launch stale and no synchronization happens here.
+absl::Status CheckDeviceKernelBarrierTimeout(
+    const RaggedAllToAllStreamState& state) {
+  if (state.barrier_timeout_host_record == nullptr) {
+    return absl::OkStatus();
+  }
+  uint64_t record = 0;
+  std::memcpy(&record, state.barrier_timeout_host_record->opaque(),
+              sizeof(record));
+  if (!HasRaggedAllToAllBarrierTimeout(record)) {
+    return absl::OkStatus();
+  }
+
+  // The record is sticky, so this fires on every subsequent launch. That is
+  // intended: the barrier's shared epoch state is left inconsistent by the
+  // timeout, so the comm cannot be reused.
+  std::string message = absl::StrCat(
+      "RaggedAllToAll: ", FormatRaggedAllToAllBarrierTimeout(record),
+      ". A peer in this LSA team never reached the barrier. The kernel exited "
+      "instead of spinning, so this device's output is incomplete and the "
+      "device communicator is no longer usable.");
+  XLA_LOG_DEVICE(ERROR, state.device_ordinal) << message;
+  return absl::InternalError(std::move(message));
+}
+
 absl::Status CheckRaggedAllToAllBounds(
     se::Stream& stream, int64_t num_total_updates, int64_t num_row_elements,
     const SymmetricMemory* output_sym_mem, size_t output_sym_offset,
@@ -328,10 +358,22 @@ absl::Status CheckRaggedAllToAllBounds(
   size_t min_expected_recv_bytes = static_cast<size_t>(total_recv_elements) *
                                    num_row_elements * element_width;
 
+  // Bytes written relative to the start of the output operand, i.e. without
+  // the window offset that max_write_bytes carries.
+  size_t max_write_bytes_in_operand =
+      static_cast<size_t>(max_write_index) * num_row_elements * element_width;
+
   size_t actual_input_size = input_buffer.size();
   size_t actual_output_size = output_sym_mem->addr().size();
+  size_t actual_output_operand_size = buffers[1].destination_buffer.size();
 
-  // Check Out-of-Bounds Reads
+  // Check Out-of-Bounds Reads.
+  //
+  // Deliberately not offset by the input's window offset the way the write
+  // check below is: the two compare against different things. Reads are bounded
+  // by the input operand, which starts at that offset, so the offset cancels;
+  // writes are bounded by the whole symmetric slice, inside which the operand
+  // starts at output_sym_offset.
   TF_RET_CHECK(max_read_bytes <= actual_input_size)
       << "RaggedAllToAll: READ violation detected! "
       << "Input read requires " << max_read_bytes
@@ -346,6 +388,19 @@ absl::Status CheckRaggedAllToAllBounds(
       << " bytes, but the symmetric memory slice is only " << actual_output_size
       << " bytes. Kernel launch aborted to prevent "
          "CUDA_ERROR_ILLEGAL_ADDRESS.";
+
+  // ...and that they stay inside the output operand, not merely inside the
+  // window. A window now backs a whole allocation and can cover several
+  // buffers, so an overrun of the operand need not run off the end of the slice
+  // and would silently corrupt a neighbour instead of faulting.
+  TF_RET_CHECK(max_write_bytes_in_operand <= actual_output_operand_size)
+      << "RaggedAllToAll: WRITE violation detected! "
+      << "Output writes require " << max_write_bytes_in_operand
+      << " bytes, but the output buffer is only " << actual_output_operand_size
+      << " bytes (symmetric slice is " << actual_output_size
+      << " bytes, operand at offset " << output_sym_offset
+      << "). Kernel launch aborted to prevent silent corruption of a "
+         "neighbouring buffer in the same window.";
 
   // Check recv_sizes
   TF_RET_CHECK(min_expected_recv_bytes <= actual_output_size)
@@ -624,6 +679,28 @@ absl::StatusOr<RaggedAllToAllStreamState*> RaggedAllToAllThunk::InitializeOnce(
   if (output_offsets_buffer_bytes > 0 &&
       state->output_offsets_device_buffer.is_null()) {
     return absl::InternalError("Failed to allocate output offsets buffer.");
+  }
+
+  if (UsesDeviceKernel()) {
+    // Diagnostics for the in-kernel cross-rank barriers (see #8870). The
+    // device-side record is sticky and must start zeroed; the pinned host copy
+    // is the destination of the readback enqueued after every launch.
+    ABSL_ASSIGN_OR_RETURN(
+        state->barrier_timeout_record,
+        params.buffer_allocations->memory_allocator()->Allocate(
+            executor->device_ordinal(), sizeof(uint64_t)));
+    if (state->barrier_timeout_record.is_null()) {
+      return absl::InternalError(
+          "Failed to allocate RaggedAllToAll barrier timeout record.");
+    }
+    se::DeviceAddressBase record = state->barrier_timeout_record.cref();
+    ABSL_RETURN_IF_ERROR(params.stream->MemZero(&record, record.size()));
+    ABSL_RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
+
+    ABSL_ASSIGN_OR_RETURN(state->barrier_timeout_host_record,
+                     executor->HostMemoryAllocate(sizeof(uint64_t)));
+    std::memset(state->barrier_timeout_host_record->opaque(), 0,
+                sizeof(uint64_t));
   }
 
   if (use_multi_gpu_barrier_with_nccl_in_one_shot_kernel() ||
@@ -975,6 +1052,24 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
         const int32_t cta_count = DeviceKernelCtaCount(core_count);
         const PrimitiveType element_type = device_buffers[0].element_type;
 
+        const int64_t barrier_timeout_cycles =
+            DeviceKernelBarrierTimeoutCycles(
+                stream.parent()->GetDeviceDescription());
+
+        // Which transport this executable selected is the first thing anyone
+        // debugging a stalled collective needs, and a stalled job has no
+        // opportunity to be re-run with VLOG on. Emit it once per process at
+        // INFO so a production run always records it, without an env var and
+        // without a line per launch.
+        static absl::once_flag transport_logged;
+        absl::call_once(transport_logged, [&] {
+          XLA_LOG_DEVICE(INFO, state->device_ordinal)
+              << "Device kernel: lsa_size=" << lsa_size
+              << " num_ranks=" << num_ranks << " gin=" << gin
+              << " cta_count=" << cta_count
+              << " barrier_timeout_cycles=" << barrier_timeout_cycles;
+        });
+
         XLA_VLOG_DEVICE(3, state->device_ordinal)
             << "Device kernel: lsa_size=" << lsa_size
             << " num_ranks=" << num_ranks << " gin=" << gin
@@ -984,13 +1079,36 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
             << " element_type="
             << primitive_util::LowercasePrimitiveTypeName(element_type);
 
-        return RunDeviceRaggedAllToAllKernel(
+        // A record published by an earlier launch on this stream. See
+        // RaggedAllToAllStreamState::barrier_timeout_host_record for why the
+        // check is one launch behind.
+        ABSL_RETURN_IF_ERROR(CheckDeviceKernelBarrierTimeout(*state));
+
+        if (VLOG_IS_ON(5)) {
+          ABSL_RETURN_IF_ERROR(CheckRaggedAllToAllBounds(
+              stream, config_.num_total_updates, config_.num_row_elements,
+              output_sym, output_offset, device_buffers));
+        }
+
+        ABSL_RETURN_IF_ERROR(RunDeviceRaggedAllToAllKernel(
             &stream, element_type, dev_comm, input_sym, output_sym,
             device_buffers[2].source_buffer, device_buffers[3].source_buffer,
             device_buffers[4].source_buffer, num_ranks, num_updates_per_replica,
             config_.num_row_elements, cta_count,
             static_cast<int64_t>(input_offset),
-            static_cast<int64_t>(output_offset));
+            static_cast<int64_t>(output_offset), barrier_timeout_cycles,
+            state->barrier_timeout_record.cref()));
+
+        // Enqueue, but never wait on, the readback of the timeout record. An
+        // 8-byte D2H is negligible next to the transport, and keeping it off
+        // the critical path is what makes this safe to leave on in production.
+        if (state->barrier_timeout_host_record == nullptr) {
+          return absl::OkStatus();
+        }
+        se::DeviceAddressBase timeout_record =
+            state->barrier_timeout_record.cref();
+        return stream.Memcpy(state->barrier_timeout_host_record->opaque(),
+                             timeout_record, sizeof(uint64_t));
       }
     }
   }

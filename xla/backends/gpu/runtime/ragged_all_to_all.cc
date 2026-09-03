@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <type_traits>
 
 #include "absl/log/log.h"
@@ -224,7 +225,9 @@ absl::Status LaunchDeviceKernel(
     se::DeviceAddressBase send_sizes_buffer,
     se::DeviceAddressBase output_offsets_buffer,
     int64_t num_updates_per_replica, int64_t num_row_elements,
-    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
+    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes,
+    int64_t barrier_timeout_cycles,
+    se::DeviceAddressBase barrier_timeout_record) {
   using KernelTrait = se::gpu::RaggedAllToAllDeviceKernel<kVectorSize>;
 
   ABSL_ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()
@@ -234,7 +237,8 @@ absl::Status LaunchDeviceKernel(
                        recv_win, input_offsets_buffer, send_sizes_buffer,
                        output_offsets_buffer, num_updates_per_replica,
                        num_row_elements, input_buffer_offset_bytes,
-                       output_buffer_offset_bytes);
+                       output_buffer_offset_bytes, barrier_timeout_cycles,
+                       barrier_timeout_record);
 }
 
 }  // namespace
@@ -247,7 +251,8 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     se::DeviceAddressBase output_offsets_buffer, int64_t num_ranks,
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t cta_count, int64_t input_buffer_offset_bytes,
-    int64_t output_buffer_offset_bytes) {
+    int64_t output_buffer_offset_bytes, int64_t barrier_timeout_cycles,
+    se::DeviceAddressBase barrier_timeout_record) {
   se::StreamExecutor* executor = stream->parent();
   // The copies are latency-bound peer stores, so throughput scales with
   // concurrent CTAs rather than threads per CTA: many small CTAs across the
@@ -271,7 +276,8 @@ absl::Status RunDeviceRaggedAllToAllKernel(
         stream, executor, thread_dims, block_dims, dev_comm, send_win, recv_win,
         input_offsets_buffer, send_sizes_buffer, output_offsets_buffer,
         num_updates_per_replica, num_vectorized_row_elements,
-        input_buffer_offset_bytes, output_buffer_offset_bytes);
+        input_buffer_offset_bytes, output_buffer_offset_bytes,
+        barrier_timeout_cycles, barrier_timeout_record);
   };
 
   switch (vector_size_bytes) {
@@ -292,6 +298,40 @@ absl::Status RunDeviceRaggedAllToAllKernel(
           " (bit width ", xla::primitive_util::BitWidth(element_type),
           ") for device RaggedAllToAll kernel."));
   }
+}
+
+bool HasRaggedAllToAllBarrierTimeout(uint64_t record) {
+  return (record >> se::gpu::kRaggedAllToAllBarrierTimeoutTagShift) ==
+         se::gpu::kRaggedAllToAllBarrierTimeoutTag;
+}
+
+std::string FormatRaggedAllToAllBarrierTimeout(uint64_t record) {
+  const uint64_t phase =
+      (record >> se::gpu::kRaggedAllToAllBarrierTimeoutPhaseShift) & 0xFF;
+  const uint64_t lsa_rank =
+      (record >> se::gpu::kRaggedAllToAllBarrierTimeoutLsaRankShift) & 0xFFFF;
+  const uint64_t world_rank =
+      (record >> se::gpu::kRaggedAllToAllBarrierTimeoutWorldRankShift) & 0xFFFF;
+  const uint64_t slot = record & 0xFFFF;
+
+  const char* phase_name = nullptr;
+  switch (phase) {
+    case se::gpu::kRaggedAllToAllBarrierPhasePreCopy:
+      phase_name = "pre-copy (rendezvous)";
+      break;
+    case se::gpu::kRaggedAllToAllBarrierPhasePostCopy:
+      phase_name = "post-copy (release)";
+      break;
+    default:
+      phase_name = "unknown";
+      break;
+  }
+
+  return absl::StrCat(
+      "device RaggedAllToAll kernel barrier timed out: world_rank=", world_rank,
+      " lsa_rank=", lsa_rank, " barrier_slot(blockIdx.x)=", slot,
+      " phase=", phase_name, " raw_record=0x",
+      absl::Hex(record, absl::kZeroPad16));
 }
 
 }  // namespace xla::gpu

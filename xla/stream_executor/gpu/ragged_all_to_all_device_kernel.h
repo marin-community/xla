@@ -39,6 +39,41 @@ namespace stream_executor::gpu {
 inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 128;
 inline constexpr int kRaggedAllToAllDeviceKernelCtasPerSm = 8;
 
+// Layout of the device kernel's cross-rank barrier timeout record.
+//
+// The in-kernel barriers have no way to report a stall: NCCL leaves
+// `abortFlag == nullptr` for user-created device comms, so the no-timeout
+// barrier waits are uninterruptible and a lost peer wedges the kernel with no
+// NCCL watchdog, no abort and no CUDA error. The kernel therefore uses NCCL's
+// timeout barrier overloads and, on expiry, publishes a single 64-bit record
+// naming the stall before exiting.
+//
+// One aligned 64-bit word is used (rather than a struct) so that the host's
+// unsynchronized readback cannot observe a torn record: the word is written
+// once by atomicCAS from 0, and is only ever interpreted when the tag byte is
+// present. The record is sticky for the life of the process; the first CTA on
+// the device to time out wins, later ones leave it alone.
+//
+//   bits [63:56]  tag, kRaggedAllToAllBarrierTimeoutTag, marks the word set
+//   bits [55:48]  phase, one of the kRaggedAllToAllBarrierPhase* values below
+//   bits [47:32]  rank of the recording device within its LSA team
+//   bits [31:16]  rank of the recording device within the world team
+//   bits [15:0]   blockIdx.x, i.e. the barrier slot that timed out
+//
+// Rank fields are truncated to 16 bits; the barrier slot count is bounded by
+// the SM count, so it always fits.
+inline constexpr uint64_t kRaggedAllToAllBarrierTimeoutTag = 0xA5;
+inline constexpr int kRaggedAllToAllBarrierTimeoutTagShift = 56;
+inline constexpr int kRaggedAllToAllBarrierTimeoutPhaseShift = 48;
+inline constexpr int kRaggedAllToAllBarrierTimeoutLsaRankShift = 32;
+inline constexpr int kRaggedAllToAllBarrierTimeoutWorldRankShift = 16;
+
+// Which of the kernel's two barrier waits expired. "Pre-copy" is the rendezvous
+// that publishes buffer readiness before any peer store; "post-copy" is the
+// release barrier that publishes the stores.
+inline constexpr uint64_t kRaggedAllToAllBarrierPhasePreCopy = 1;
+inline constexpr uint64_t kRaggedAllToAllBarrierPhasePostCopy = 2;
+
 template <int64_t kVectorSize>
 struct RaggedAllToAllDeviceKernel {
   using KernelType = stream_executor::TypedKernel<
@@ -51,7 +86,9 @@ struct RaggedAllToAllDeviceKernel {
       int64_t,                             // num_updates_per_replica
       int64_t,                             // num_row_elements
       int64_t,                             // input_buffer_offset_bytes
-      int64_t>;                            // output_buffer_offset_bytes
+      int64_t,                             // output_buffer_offset_bytes
+      int64_t,                             // barrier_timeout_cycles
+      stream_executor::DeviceAddressBase>;  // barrier_timeout_record
 };
 
 }  // namespace stream_executor::gpu
