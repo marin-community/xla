@@ -158,6 +158,13 @@ __device__ void RaggedAllToAllCopy(
             flat_idx, num_updates_per_replica, num_row_elements,
             input_buffer_offset_bytes, output_buffer_offset_bytes,
             input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
+      // A zero-size update moves no bytes, but the receiver's waitSignal target
+      // below counts every remote (peer, update) pair, so its signal still has
+      // to arrive. `put` is what carries the increment, so skipping the update
+      // outright leaves the receiver short and it waits forever: waitSignal has
+      // no timeout. Signal without transferring instead. `peer` is assigned
+      // before the send-size test, so it is valid here.
+      gin->signal(world, meta.peer, ncclGin_SignalInc{signal_index});
       continue;
     }
 
