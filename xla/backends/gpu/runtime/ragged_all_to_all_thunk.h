@@ -46,6 +46,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/tsl/util/env_var.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/util/tied_ref.h"
@@ -210,8 +211,21 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // compute scheduled against it. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
+  //
+  // XLA_RAGGED_ALL_TO_ALL_CTA_HEADROOM reserves that many SMs by shrinking the
+  // grid. The LSA barrier makes CTA k wait on CTA k of every peer, so a CTA
+  // that is never scheduled stalls its peers with no timeout and no error. A
+  // grid sized to the whole device leaves no room for a concurrently resident
+  // kernel, and at multi-rack scale the cross-rack AllReduce is exactly that.
+  // Zero keeps the current behaviour.
   static int32_t DeviceKernelCtaCount(int core_count) {
-    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
+    int64_t headroom = 0;
+    // Diagnostic knob for marin-community/marin#8870; not a supported flag.
+    tsl::ReadInt64FromEnvVar("XLA_RAGGED_ALL_TO_ALL_CTA_HEADROOM", 0, &headroom)
+        .IgnoreError();
+    const int32_t reserved =
+        static_cast<int32_t>(std::clamp<int64_t>(headroom, 0, core_count));
+    return std::max<int32_t>(core_count - reserved, kMinDeviceKernelCtaCount);
   }
 
   // Per-wait budget for the device kernel's cross-rank barriers, in SM clock
