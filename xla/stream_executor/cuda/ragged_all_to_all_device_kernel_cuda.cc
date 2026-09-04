@@ -47,7 +47,11 @@ limitations under the License.
   REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(                                   \
       VECTOR_SIZE##BytesStock, VECTOR_SIZE,                                   \
       stream_executor::gpu::kRaggedAllToAllStockThreadsPerCta,                \
-      stream_executor::gpu::kRaggedAllToAllStockCtasPerSm)
+      stream_executor::gpu::kRaggedAllToAllStockCtasPerSm)                    \
+  REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(                                   \
+      VECTOR_SIZE##BytesUncapped, VECTOR_SIZE,                                \
+      stream_executor::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta,         \
+      stream_executor::gpu::kRaggedAllToAllUncappedCtasPerSm)
 
 REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(1);
 REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL_GEOMETRIES(2);

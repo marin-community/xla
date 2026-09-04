@@ -193,7 +193,7 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // from the environment, once per process, so one wheel can draw every cell of
   // the matrix in a single interleaved session:
   //
-  //   MARIN_RA2A_GEOMETRY   = stock | narrow | wide     (default narrow)
+  //   MARIN_RA2A_GEOMETRY   = stock | narrow | wide | uncapped   (default narrow)
   //   MARIN_RA2A_ASSIGNMENT = fixed | balanced          (default balanced)
   //
   // The default pair is the fork tip. stock+fixed is upstream. Read once into a
@@ -209,8 +209,11 @@ class RaggedAllToAllThunk : public CollectiveThunk {
       if (absl::string_view(v) == "wide") {
         return se::gpu::RaggedAllToAllGeometry::kWide;
       }
+      if (absl::string_view(v) == "uncapped") {
+        return se::gpu::RaggedAllToAllGeometry::kUncapped;
+      }
       CHECK_EQ(absl::string_view(v), "narrow")
-          << "MARIN_RA2A_GEOMETRY must be stock, narrow or wide";
+          << "MARIN_RA2A_GEOMETRY must be stock, narrow, wide or uncapped";
       return se::gpu::RaggedAllToAllGeometry::kNarrow;
     }();
     return geometry;
@@ -262,6 +265,7 @@ class RaggedAllToAllThunk : public CollectiveThunk {
       case se::gpu::RaggedAllToAllGeometry::kStock:
         return DeviceKernelStockCtaCount(core_count, num_active_updates);
       case se::gpu::RaggedAllToAllGeometry::kNarrow:
+      case se::gpu::RaggedAllToAllGeometry::kUncapped:
         return DeviceKernelCtaCount(core_count);
       case se::gpu::RaggedAllToAllGeometry::kWide:
         return std::max<int32_t>(

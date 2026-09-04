@@ -48,11 +48,17 @@ inline constexpr int kRaggedAllToAllStockThreadsPerCta = 512;
 inline constexpr int kRaggedAllToAllStockCtasPerSm = 1;
 inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 128;
 inline constexpr int kRaggedAllToAllDeviceKernelCtasPerSm = 8;
+// kUncapped: the narrow grid on an instantiation whose launch bounds ask for
+// one block per SM, so the register cap is lifted. ptxas -v on the PR head
+// (sm_100) gives 61-62 registers/thread at minBlocks=8 and 84-86 at 1, with no
+// spills either way; this arm prices that difference.
+inline constexpr int kRaggedAllToAllUncappedCtasPerSm = 1;
 
 enum class RaggedAllToAllGeometry {
   kStock,   // 512-thread CTAs; grid derived from the active update count.
   kNarrow,  // 128-thread CTAs, one per SM.
   kWide,    // 128-thread CTAs, kRaggedAllToAllDeviceKernelCtasPerSm per SM.
+  kUncapped,  // As kNarrow, but launch bounds (128, 1): no register cap.
 };
 
 // How the LSA copy is spread over the grid. Passed as a kernel argument rather

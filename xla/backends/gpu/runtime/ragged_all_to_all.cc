@@ -257,6 +257,12 @@ absl::Status LaunchDeviceKernelForGeometry(
                               se::gpu::kRaggedAllToAllStockCtasPerSm>(
         std::forward<Args>(args)...);
   }
+  if (geometry == se::gpu::RaggedAllToAllGeometry::kUncapped) {
+    return LaunchDeviceKernel<kVectorSize,
+                              se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta,
+                              se::gpu::kRaggedAllToAllUncappedCtasPerSm>(
+        std::forward<Args>(args)...);
+  }
   return LaunchDeviceKernel<
       kVectorSize, se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta,
       se::gpu::kRaggedAllToAllDeviceKernelCtasPerSm>(
