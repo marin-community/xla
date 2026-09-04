@@ -273,9 +273,10 @@ absl::Status CheckDeviceKernelBarrierTimeout(
   if (state.barrier_timeout_host_record == nullptr) {
     return absl::OkStatus();
   }
-  uint64_t record = 0;
-  std::memcpy(&record, state.barrier_timeout_host_record->opaque(),
-              sizeof(record));
+  uint64_t words[se::gpu::kRaggedAllToAllBarrierRecordWords] = {};
+  std::memcpy(words, state.barrier_timeout_host_record->opaque(),
+              sizeof(words));
+  const uint64_t record = words[se::gpu::kRaggedAllToAllBarrierTimeoutWord];
   if (!HasRaggedAllToAllBarrierTimeout(record)) {
     return absl::OkStatus();
   }
@@ -290,6 +291,57 @@ absl::Status CheckDeviceKernelBarrierTimeout(
       "device communicator is no longer usable.");
   XLA_LOG_DEVICE(ERROR, state.device_ordinal) << message;
   return absl::InternalError(std::move(message));
+}
+
+// Reports growth in the longest barrier wait either phase has seen (see #8870).
+//
+// The timeout record above only ever appears once a wait has already blown its
+// entire budget, which makes a clean run indistinguishable from a run that came
+// within a millisecond of stalling. These marks close that gap: they are the
+// same measurement without the threshold, so a run that never hangs still
+// yields the shape of the distribution whose extreme is the reported failure.
+//
+// Read from the same stale-by-one-launch host copy as the timeout record, and
+// for the same reason: the marks are monotone, so a late read is still true.
+// Only growth past `kGrowthFactor` is logged, and only above `kFloorMs`, so a
+// healthy run emits a handful of lines as the mark settles and then goes quiet
+// - loud enough to show a rising tail, quiet enough to leave on in production.
+void LogDeviceKernelBarrierWaitGrowth(RaggedAllToAllStreamState& state,
+                                      double clock_ghz) {
+  if (state.barrier_timeout_host_record == nullptr) {
+    return;
+  }
+  uint64_t words[se::gpu::kRaggedAllToAllBarrierRecordWords] = {};
+  std::memcpy(words, state.barrier_timeout_host_record->opaque(),
+              sizeof(words));
+
+  constexpr double kGrowthFactor = 2.0;
+  constexpr double kFloorMs = 1.0;
+  const double cycles_per_ms = clock_ghz * 1e6;
+
+  struct Phase {
+    const char* name;
+    uint64_t observed;
+    uint64_t* reported;
+  };
+  const Phase phases[] = {
+      {"pre-copy", words[se::gpu::kRaggedAllToAllBarrierMaxPreCopyWord],
+       &state.logged_max_pre_copy_cycles},
+      {"post-copy", words[se::gpu::kRaggedAllToAllBarrierMaxPostCopyWord],
+       &state.logged_max_post_copy_cycles},
+  };
+  for (const Phase& phase : phases) {
+    const double observed_ms = phase.observed / cycles_per_ms;
+    if (observed_ms < kFloorMs ||
+        phase.observed < *phase.reported * kGrowthFactor) {
+      continue;
+    }
+    XLA_LOG_DEVICE(INFO, state.device_ordinal)
+        << "RaggedAllToAll: longest " << phase.name << " barrier wait now "
+        << observed_ms << " ms (was "
+        << (*phase.reported / cycles_per_ms) << " ms).";
+    *phase.reported = phase.observed;
+  }
 }
 
 absl::Status CheckRaggedAllToAllBounds(
@@ -685,10 +737,12 @@ absl::StatusOr<RaggedAllToAllStreamState*> RaggedAllToAllThunk::InitializeOnce(
     // Diagnostics for the in-kernel cross-rank barriers (see #8870). The
     // device-side record is sticky and must start zeroed; the pinned host copy
     // is the destination of the readback enqueued after every launch.
+    constexpr size_t kRecordBytes =
+        se::gpu::kRaggedAllToAllBarrierRecordWords * sizeof(uint64_t);
     ABSL_ASSIGN_OR_RETURN(
         state->barrier_timeout_record,
         params.buffer_allocations->memory_allocator()->Allocate(
-            executor->device_ordinal(), sizeof(uint64_t)));
+            executor->device_ordinal(), kRecordBytes));
     if (state->barrier_timeout_record.is_null()) {
       return absl::InternalError(
           "Failed to allocate RaggedAllToAll barrier timeout record.");
@@ -698,9 +752,8 @@ absl::StatusOr<RaggedAllToAllStreamState*> RaggedAllToAllThunk::InitializeOnce(
     ABSL_RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
 
     ABSL_ASSIGN_OR_RETURN(state->barrier_timeout_host_record,
-                     executor->HostMemoryAllocate(sizeof(uint64_t)));
-    std::memset(state->barrier_timeout_host_record->opaque(), 0,
-                sizeof(uint64_t));
+                     executor->HostMemoryAllocate(kRecordBytes));
+    std::memset(state->barrier_timeout_host_record->opaque(), 0, kRecordBytes);
   }
 
   if (use_multi_gpu_barrier_with_nccl_in_one_shot_kernel() ||
@@ -1083,6 +1136,9 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
         // RaggedAllToAllStreamState::barrier_timeout_host_record for why the
         // check is one launch behind.
         ABSL_RETURN_IF_ERROR(CheckDeviceKernelBarrierTimeout(*state));
+        LogDeviceKernelBarrierWaitGrowth(
+            *state, DeviceKernelClockGhz(
+                        stream.parent()->GetDeviceDescription()));
 
         if (VLOG_IS_ON(5)) {
           ABSL_RETURN_IF_ERROR(CheckRaggedAllToAllBounds(
@@ -1108,7 +1164,7 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
         se::DeviceAddressBase timeout_record =
             state->barrier_timeout_record.cref();
         return stream.Memcpy(state->barrier_timeout_host_record->opaque(),
-                             timeout_record, sizeof(uint64_t));
+                             timeout_record, timeout_record.size());
       }
     }
   }

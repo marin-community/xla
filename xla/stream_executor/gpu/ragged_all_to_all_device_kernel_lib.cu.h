@@ -218,6 +218,32 @@ __device__ inline void RecordRaggedAllToAllBarrierTimeout(
             static_cast<unsigned long long>(record));
 }
 
+// Publishes a new high-water mark for one barrier phase's wait, in SM cycles.
+//
+// A timeout record only appears once a wait has already blown its whole budget.
+// The high-water mark is the same measurement without that threshold, so a run
+// that completes cleanly still reports how close its barriers came. If the
+// longest wait grows over a run, that is the tail of the distribution whose
+// extreme is the #8870 stall, observed without having to reproduce it.
+//
+// The non-atomic read before the atomic is a deliberate filter, not a check:
+// the word is monotone, so a stale read can only cause a redundant atomicMax,
+// never a lost update. After the first few launches the mark stops moving and
+// essentially every CTA takes the early return, which is what keeps 152 CTAs
+// from serializing on one address twice per launch.
+__device__ inline void RecordRaggedAllToAllBarrierWait(
+    uint64_t* __restrict__ record_ptr, int word, uint64_t cycles) {
+  if (record_ptr == nullptr || threadIdx.x != 0) {
+    return;
+  }
+  uint64_t* slot = record_ptr + word;
+  if (cycles <= *slot) {
+    return;
+  }
+  atomicMax(reinterpret_cast<unsigned long long*>(slot),
+            static_cast<unsigned long long>(cycles));
+}
+
 template <int64_t kVectorSize>
 __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
                                   kRaggedAllToAllDeviceKernelCtasPerSm)
@@ -259,9 +285,16 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     // NB: gin.waitSignal below has no timeout overload in NCCL, so the GIN
     // path is only partially bounded. The reported stall (#8870) is on the
     // pure-LSA path.
-    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+    const uint64_t pre_wait_start = clock64();
+    // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
+    // barrier together and thread 0's elapsed count describes all of it.
+    const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_acquire,
-            ncclGinFenceLevel::Relaxed, timeout_cycles))) {
+            ncclGinFenceLevel::Relaxed, timeout_cycles));
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierMaxPreCopyWord,
+                                    clock64() - pre_wait_start);
+    if (pre_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePreCopy,
                                          world.rank, lsa.rank);
@@ -282,9 +315,16 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     }
 
     gin.flush(ncclCoopCta());
-    if (RaggedAllToAllBarrierTimedOut(bar.sync(
+    const uint64_t post_wait_start = clock64();
+    // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
+    // barrier together and thread 0's elapsed count describes all of it.
+    const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_release,
-            ncclGinFenceLevel::Relaxed, timeout_cycles))) {
+            ncclGinFenceLevel::Relaxed, timeout_cycles));
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierMaxPostCopyWord,
+                                    clock64() - post_wait_start);
+    if (post_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePostCopy,
                                          world.rank, lsa.rank);
@@ -293,8 +333,15 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
   } else {
     ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), dev_comm,
                                            ncclTeamTagLsa{}, blockIdx.x};
-    if (RaggedAllToAllBarrierTimedOut(bar.sync(
-            ncclCoopCta(), ::cuda::memory_order_relaxed, timeout_cycles))) {
+    const uint64_t pre_wait_start = clock64();
+    // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
+    // barrier together and thread 0's elapsed count describes all of it.
+    const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_relaxed, timeout_cycles));
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierMaxPreCopyWord,
+                                    clock64() - pre_wait_start);
+    if (pre_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePreCopy,
                                          world.rank, lsa.rank);
@@ -307,8 +354,15 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
         lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
 
-    if (RaggedAllToAllBarrierTimedOut(bar.sync(
-            ncclCoopCta(), ::cuda::memory_order_release, timeout_cycles))) {
+    const uint64_t post_wait_start = clock64();
+    // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
+    // barrier together and thread 0's elapsed count describes all of it.
+    const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_release, timeout_cycles));
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierMaxPostCopyWord,
+                                    clock64() - post_wait_start);
+    if (post_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePostCopy,
                                          world.rank, lsa.rank);

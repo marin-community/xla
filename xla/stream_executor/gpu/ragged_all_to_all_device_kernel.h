@@ -74,6 +74,27 @@ inline constexpr int kRaggedAllToAllBarrierTimeoutWorldRankShift = 16;
 inline constexpr uint64_t kRaggedAllToAllBarrierPhasePreCopy = 1;
 inline constexpr uint64_t kRaggedAllToAllBarrierPhasePostCopy = 2;
 
+// Layout of the record buffer the kernel publishes into. Three aligned 64-bit
+// words, each written independently and read back together:
+//
+//   [0] the timeout record described above
+//   [1] the longest pre-copy barrier wait observed on this device, in cycles
+//   [2] the longest post-copy barrier wait observed on this device, in cycles
+//
+// The wait words exist because a stall is the tail of a distribution rather
+// than a separate phenomenon: a run that never times out still carries evidence
+// in how long its barriers waited. Recording the high-water mark per phase is
+// what makes a hang-free run informative instead of a single "no timeout" bit,
+// which is the whole difficulty in #8870 -- eight reproduction attempts have
+// each returned exactly that bit.
+//
+// Both wait words are monotone high-water marks, sticky for the life of the
+// process, so an unsynchronized host readback of either is always meaningful.
+inline constexpr int kRaggedAllToAllBarrierRecordWords = 3;
+inline constexpr int kRaggedAllToAllBarrierTimeoutWord = 0;
+inline constexpr int kRaggedAllToAllBarrierMaxPreCopyWord = 1;
+inline constexpr int kRaggedAllToAllBarrierMaxPostCopyWord = 2;
+
 template <int64_t kVectorSize>
 struct RaggedAllToAllDeviceKernel {
   using KernelType = stream_executor::TypedKernel<

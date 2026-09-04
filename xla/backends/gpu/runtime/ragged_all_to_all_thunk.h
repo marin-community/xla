@@ -127,19 +127,26 @@ struct RaggedAllToAllStreamState {
   // Device memory buffer to store the output buffer pointers.
   std::unique_ptr<se::MemoryAllocation> output_buffer_ptr_storage;
 
-  // Device kernel barrier timeout diagnostics (see #8870). The kernel bounds
-  // its cross-rank barrier waits and, on expiry, publishes a single 64-bit
-  // record here naming the rank, the barrier slot and the barrier phase that
-  // stalled; the record is sticky for the life of the process. Allocated only
-  // on the device-kernel path.
+  // Device kernel barrier diagnostics (see #8870), a
+  // kRaggedAllToAllBarrierRecordWords-word buffer. The kernel bounds its
+  // cross-rank barrier waits and, on expiry, publishes a record naming the
+  // rank, the barrier slot and the barrier phase that stalled; alongside it, it
+  // keeps the longest wait seen per phase, so a run that never stalls still
+  // reports how close it came. Every word is sticky for the life of the
+  // process. Allocated only on the device-kernel path.
   se::ScopedDeviceAddress<uint8_t> barrier_timeout_record;
 
   // Pinned host destination for the readback of `barrier_timeout_record`. The
   // readback is enqueued after every device-kernel launch and never waited on,
-  // so the host copy lags the device by at least one launch. That is fine: a
-  // stalled barrier is sticky, and one aligned 64-bit word cannot be observed
-  // torn.
+  // so the host copy lags the device by at least one launch. That is fine:
+  // every word is sticky, and an aligned 64-bit word cannot be observed torn.
   std::unique_ptr<se::MemoryAllocation> barrier_timeout_host_record;
+
+  // Longest barrier wait per phase already reported at INFO, in SM cycles.
+  // Only growth is logged, so the log carries the shape of the tail over a run
+  // rather than a line per launch.
+  uint64_t logged_max_pre_copy_cycles = 0;
+  uint64_t logged_max_post_copy_cycles = 0;
 
   // Contains the output buffer pointers and barrier signal buffers for all
   // peers.
@@ -241,14 +248,23 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   static int64_t DeviceKernelBarrierTimeoutCycles(
       const se::DeviceDescription& device_description) {
     constexpr double kTargetSeconds = 45.0;
-    // clock_rate_ghz() is kUninitialized<float> (-1) on platforms that do not
-    // report it. Fall back to a deliberately high clock so the fallback errs
-    // towards a longer timeout rather than a spurious one.
+    return static_cast<int64_t>(kTargetSeconds *
+                                DeviceKernelClockGhz(device_description) * 1e9);
+  }
+
+  // SM clock rate used both to set the timeout budget above and to render the
+  // recorded barrier waits as wall time.
+  //
+  // clock_rate_ghz() is kUninitialized<float> (-1) on platforms that do not
+  // report it. Fall back to a deliberately high clock so the fallback errs
+  // towards a longer timeout rather than a spurious one; the same bias makes a
+  // reported wait an under-estimate rather than an alarming over-estimate.
+  static double DeviceKernelClockGhz(
+      const se::DeviceDescription& device_description) {
     constexpr double kFallbackClockGhz = 3.0;
-    const double clock_ghz = device_description.clock_rate_ghz() > 0.0f
-                                 ? device_description.clock_rate_ghz()
-                                 : kFallbackClockGhz;
-    return static_cast<int64_t>(kTargetSeconds * clock_ghz * 1e9);
+    return device_description.clock_rate_ghz() > 0.0f
+               ? device_description.clock_rate_ghz()
+               : kFallbackClockGhz;
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
