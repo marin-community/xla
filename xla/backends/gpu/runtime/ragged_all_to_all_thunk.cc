@@ -307,7 +307,9 @@ absl::Status CheckDeviceKernelBarrierTimeout(
 // healthy run emits a handful of lines as the mark settles and then goes quiet
 // - loud enough to show a rising tail, quiet enough to leave on in production.
 void LogDeviceKernelBarrierWaitGrowth(RaggedAllToAllStreamState& state,
-                                      double clock_ghz) {
+                                      double clock_ghz,
+                                      absl::string_view annotation,
+                                      RunId run_id) {
   if (state.barrier_timeout_host_record == nullptr) {
     return;
   }
@@ -337,11 +339,39 @@ void LogDeviceKernelBarrierWaitGrowth(RaggedAllToAllStreamState& state,
       continue;
     }
     XLA_LOG_DEVICE(INFO, state.device_ordinal)
-        << "RaggedAllToAll: longest " << phase.name << " barrier wait now "
-        << observed_ms << " ms (was "
-        << (*phase.reported / cycles_per_ms) << " ms).";
+        << "RaggedAllToAll[" << annotation << "] run_id=" << run_id.ToString()
+        << ": longest " << phase.name << " barrier wait now " << observed_ms
+        << " ms (was " << (*phase.reported / cycles_per_ms) << " ms).";
     *phase.reported = phase.observed;
   }
+
+  // Per-launch report. Word [5] names the launch the readback belongs to; a
+  // launch is reported once, when either of its waits clears the threshold.
+  // The threshold is an env knob because the right value is exactly what the
+  // #8870 investigation is measuring; 10 ms is ~4x the healthy p99.
+  static const double kLaunchLogMs = [] {
+    int64_t ms = 10;
+    tsl::ReadInt64FromEnvVar("XLA_RAGGED_ALL_TO_ALL_WAIT_LOG_MS", 10, &ms)
+        .IgnoreError();
+    return static_cast<double>(ms);
+  }();
+  const int64_t launch =
+      static_cast<int64_t>(words[se::gpu::kRaggedAllToAllBarrierLaunchIndexWord] &
+                           0xFFFFFFFFu);
+  if (launch == state.reported_launch_index) {
+    return;
+  }
+  const double launch_pre_ms =
+      words[se::gpu::kRaggedAllToAllBarrierLaunchPreCopyWord] / cycles_per_ms;
+  const double launch_post_ms =
+      words[se::gpu::kRaggedAllToAllBarrierLaunchPostCopyWord] / cycles_per_ms;
+  if (launch_pre_ms >= kLaunchLogMs || launch_post_ms >= kLaunchLogMs) {
+    XLA_LOG_DEVICE(INFO, state.device_ordinal)
+        << "RaggedAllToAll[" << annotation << "] run_id=" << run_id.ToString()
+        << " launch=" << launch << ": pre-copy wait " << launch_pre_ms
+        << " ms, post-copy wait " << launch_post_ms << " ms.";
+  }
+  state.reported_launch_index = launch;
 }
 
 absl::Status CheckRaggedAllToAllBounds(
@@ -1137,8 +1167,31 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
         // check is one launch behind.
         ABSL_RETURN_IF_ERROR(CheckDeviceKernelBarrierTimeout(*state));
         LogDeviceKernelBarrierWaitGrowth(
-            *state, DeviceKernelClockGhz(
-                        stream.parent()->GetDeviceDescription()));
+            *state,
+            DeviceKernelClockGhz(stream.parent()->GetDeviceDescription()),
+            profile_annotation(), params.collective_params->run_id);
+
+        // Arm the per-launch words on the stream, ahead of the kernel: zero
+        // this launch's waits and stamp its index (low 32 bits; Memset32
+        // fills both halves, the reader masks). Two tiny stream ops, in
+        // order, so the kernel always sees a fresh slate.
+        {
+          se::DeviceAddressBase launch_words =
+              state->barrier_timeout_record.cref().GetByteSlice(
+                  se::gpu::kRaggedAllToAllBarrierLaunchPreCopyWord *
+                      sizeof(uint64_t),
+                  2 * sizeof(uint64_t));
+          ABSL_RETURN_IF_ERROR(stream.MemZero(&launch_words, launch_words.size()));
+          se::DeviceAddressBase index_word =
+              state->barrier_timeout_record.cref().GetByteSlice(
+                  se::gpu::kRaggedAllToAllBarrierLaunchIndexWord *
+                      sizeof(uint64_t),
+                  sizeof(uint64_t));
+          ABSL_RETURN_IF_ERROR(stream.Memset32(
+              &index_word, static_cast<uint32_t>(state->launch_index),
+              index_word.size()));
+          ++state->launch_index;
+        }
 
         if (VLOG_IS_ON(5)) {
           ABSL_RETURN_IF_ERROR(CheckRaggedAllToAllBounds(

@@ -90,10 +90,20 @@ inline constexpr uint64_t kRaggedAllToAllBarrierPhasePostCopy = 2;
 //
 // Both wait words are monotone high-water marks, sticky for the life of the
 // process, so an unsynchronized host readback of either is always meaningful.
-inline constexpr int kRaggedAllToAllBarrierRecordWords = 3;
+//
+// Words [3..5] are per-launch rather than sticky. The host zeroes [3] and [4]
+// and writes the launch index into [5] on the stream before each launch, so
+// after the launch they hold that launch's longest waits and its identity.
+// This is what makes every stall visible and countable: the sticky marks only
+// log when a mark doubles, so a stall the same size as an earlier one is
+// invisible to them.
+inline constexpr int kRaggedAllToAllBarrierRecordWords = 6;
 inline constexpr int kRaggedAllToAllBarrierTimeoutWord = 0;
 inline constexpr int kRaggedAllToAllBarrierMaxPreCopyWord = 1;
 inline constexpr int kRaggedAllToAllBarrierMaxPostCopyWord = 2;
+inline constexpr int kRaggedAllToAllBarrierLaunchPreCopyWord = 3;
+inline constexpr int kRaggedAllToAllBarrierLaunchPostCopyWord = 4;
+inline constexpr int kRaggedAllToAllBarrierLaunchIndexWord = 5;
 
 template <int64_t kVectorSize>
 struct RaggedAllToAllDeviceKernel {

@@ -148,6 +148,12 @@ struct RaggedAllToAllStreamState {
   uint64_t logged_max_pre_copy_cycles = 0;
   uint64_t logged_max_post_copy_cycles = 0;
 
+  // Per-launch bookkeeping for the non-sticky words: the index stamped into
+  // the record before each launch, and the last index the host has reported,
+  // so the stale-by-one readback never reports the same launch twice.
+  int64_t launch_index = 0;
+  int64_t reported_launch_index = -1;
+
   // Contains the output buffer pointers and barrier signal buffers for all
   // peers.
   std::shared_ptr<std::vector<RaggedAllToAllRendezvousValue>> participants;

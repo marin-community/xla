@@ -291,9 +291,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_acquire,
             ncclGinFenceLevel::Relaxed, timeout_cycles));
+    const uint64_t pre_wait_cycles = clock64() - pre_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPreCopyWord,
-                                    clock64() - pre_wait_start);
+                                    pre_wait_cycles);
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierLaunchPreCopyWord,
+                                    pre_wait_cycles);
     if (pre_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePreCopy,
@@ -321,9 +325,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_release,
             ncclGinFenceLevel::Relaxed, timeout_cycles));
+    const uint64_t post_wait_cycles = clock64() - post_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPostCopyWord,
-                                    clock64() - post_wait_start);
+                                    post_wait_cycles);
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierLaunchPostCopyWord,
+                                    post_wait_cycles);
     if (post_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePostCopy,
@@ -338,9 +346,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     // barrier together and thread 0's elapsed count describes all of it.
     const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_relaxed, timeout_cycles));
+    const uint64_t pre_wait_cycles = clock64() - pre_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPreCopyWord,
-                                    clock64() - pre_wait_start);
+                                    pre_wait_cycles);
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierLaunchPreCopyWord,
+                                    pre_wait_cycles);
     if (pre_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePreCopy,
@@ -359,9 +371,13 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     // barrier together and thread 0's elapsed count describes all of it.
     const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_release, timeout_cycles));
+    const uint64_t post_wait_cycles = clock64() - post_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPostCopyWord,
-                                    clock64() - post_wait_start);
+                                    post_wait_cycles);
+    RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
+                                    kRaggedAllToAllBarrierLaunchPostCopyWord,
+                                    post_wait_cycles);
     if (post_timed_out) {
       RecordRaggedAllToAllBarrierTimeout(barrier_timeout_record,
                                          kRaggedAllToAllBarrierPhasePostCopy,
