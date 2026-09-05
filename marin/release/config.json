@@ -2,7 +2,6 @@
   "schema_version": 1,
   "jax_commit": "2d66622450e2c8633cda2307688ef7aa294bd6eb",
   "jax_version": "0.11.1",
-  "cuda_compute_capabilities": "sm_100",
   "bazel_jobs": 4,
   "max_wheel_size_mb": 400,
   "validation": {
