@@ -288,9 +288,19 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const uint64_t pre_wait_start = clock64();
     // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
     // barrier together and thread 0's elapsed count describes all of it.
+#if NCCL_VERSION_CODE >= 23000
     const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_acquire,
             ncclGinFenceLevel::Relaxed, timeout_cycles));
+#else
+    // NCCL < 2.30 has no bounded barrier: the wait is unbounded and unreportable,
+    // exactly as the wheel that hung was built (marin-community/marin#8870).
+    // The wait marks still measure it.
+    bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_acquire,
+            ncclGinFenceLevel::Relaxed);
+    const bool pre_timed_out = false;
+#endif
     const uint64_t pre_wait_cycles = clock64() - pre_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPreCopyWord,
@@ -322,9 +332,19 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const uint64_t post_wait_start = clock64();
     // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
     // barrier together and thread 0's elapsed count describes all of it.
+#if NCCL_VERSION_CODE >= 23000
     const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_release,
             ncclGinFenceLevel::Relaxed, timeout_cycles));
+#else
+    // NCCL < 2.30 has no bounded barrier: the wait is unbounded and unreportable,
+    // exactly as the wheel that hung was built (marin-community/marin#8870).
+    // The wait marks still measure it.
+    bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_release,
+            ncclGinFenceLevel::Relaxed);
+    const bool post_timed_out = false;
+#endif
     const uint64_t post_wait_cycles = clock64() - post_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPostCopyWord,
@@ -344,8 +364,17 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const uint64_t pre_wait_start = clock64();
     // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
     // barrier together and thread 0's elapsed count describes all of it.
+#if NCCL_VERSION_CODE >= 23000
     const bool pre_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_relaxed, timeout_cycles));
+#else
+    // NCCL < 2.30 has no bounded barrier: the wait is unbounded and unreportable,
+    // exactly as the wheel that hung was built (marin-community/marin#8870).
+    // The wait marks still measure it.
+    bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_relaxed);
+    const bool pre_timed_out = false;
+#endif
     const uint64_t pre_wait_cycles = clock64() - pre_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPreCopyWord,
@@ -369,8 +398,17 @@ __global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta,
     const uint64_t post_wait_start = clock64();
     // Every timeout overload ends in coop.sync(), so the whole CTA leaves the
     // barrier together and thread 0's elapsed count describes all of it.
+#if NCCL_VERSION_CODE >= 23000
     const bool post_timed_out = RaggedAllToAllBarrierTimedOut(bar.sync(
             ncclCoopCta(), ::cuda::memory_order_release, timeout_cycles));
+#else
+    // NCCL < 2.30 has no bounded barrier: the wait is unbounded and unreportable,
+    // exactly as the wheel that hung was built (marin-community/marin#8870).
+    // The wait marks still measure it.
+    bar.sync(
+            ncclCoopCta(), ::cuda::memory_order_release);
+    const bool post_timed_out = false;
+#endif
     const uint64_t post_wait_cycles = clock64() - post_wait_start;
     RecordRaggedAllToAllBarrierWait(barrier_timeout_record,
                                     kRaggedAllToAllBarrierMaxPostCopyWord,

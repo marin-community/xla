@@ -81,7 +81,8 @@ fi
 # compiled-versus-runtime version and deepCopyDevCommRequirements normalises the requirement
 # structs -- but the device-side API only grows in the newer headers, so the barrier timeout used
 # by the ragged all-to-all kernel is unavailable when building against 2.29.7.
-: "${HERMETIC_NCCL_VERSION:=2.30.7}"
+# A/B variant: compile the device kernels against 2.29.7, the skew the hung wheel ran with.
+: "${HERMETIC_NCCL_VERSION:=2.29.7}"
 
 cd "$jax_dir"
 python3 build/build.py build \
