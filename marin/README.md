@@ -58,8 +58,8 @@ uv run config/update-external.py --promote-pjrt-release marin-xla-pjrt-manifest.
 
 Marin's change compiles into the GPU PJRT plugin, so `jax-cuda13-pjrt` is the only wheel built here.
 CI builds it for `aarch64` with the CUDA targets from the pinned JAX release's `.bazelrc`,
-including Hopper and Blackwell. The candidate manifest records those targets; promotion
-validates the patched transport on GB200. The other three wheels are stock: install
+including Hopper and Blackwell. Promotion validates the patched transport on GB200.
+The other three wheels are stock: install
 `jax[cuda13]` from PyPI at the `jax_version` in `marin/release/config.json`. Do not change one
 alone. `jax-cuda13-plugin` pins an exact `jax-cuda13-pjrt` version and shares an ABI with it, and a
 different generation also changes NCCL.

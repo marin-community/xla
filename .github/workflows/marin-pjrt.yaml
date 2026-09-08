@@ -161,9 +161,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: marin-xla-pjrt-wheel
-          path: |
-            dist/*.whl
-            dist/sm-targets.json
+          path: dist/*.whl
           if-no-files-found: error
           retention-days: 14
 
@@ -200,13 +198,12 @@ jobs:
             --arg version "${{ needs.build.outputs.version }}" \
             --arg filename "$WHEEL_NAME" \
             --arg sha256 "$WHEEL_SHA256" \
-            --argjson sm_targets "$(cat candidate/sm-targets.json)" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '{candidate_tag: $tag, run_url: $run_url,
               source: {fork_commit: $fork_commit, upstream_base: $upstream_base},
               jax: {commit: $jax_commit, version: $jax_version},
               wheel: {filename: $filename, sha256: $sha256, version: $version,
-                      architecture: "aarch64", sm_targets: $sm_targets}}' \
+                      architecture: "aarch64"}}' \
             > candidate/marin-xla-pjrt-candidate.json
           cat candidate/marin-xla-pjrt-candidate.json
 

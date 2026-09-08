@@ -58,7 +58,6 @@ def main() -> None:
         "platforms": [
             {
                 "architecture": wheel["architecture"],
-                "sm_targets": wheel["sm_targets"],
                 "wheel": {"filename": wheel["filename"], "sha256": wheel["sha256"]},
             }
         ],

@@ -75,29 +75,6 @@ if ! grep -q "std::max<int32_t>(core_count, kMinDeviceKernelCtaCount)" \
 fi
 
 cd "$jax_dir"
-# Record the pinned JAX release's defaults without overriding them. Promotion uses
-# this record to describe the architectures compiled into the wheel.
-python3 - "$CUDA_MAJOR_VERSION" "$OUT_DIR/sm-targets.json" <<'PY'
-import json
-import shlex
-import sys
-from pathlib import Path
-
-prefix = f"common:cuda_v{sys.argv[1]} "
-setting = "HERMETIC_CUDA_COMPUTE_CAPABILITIES="
-values = [
-    token.removeprefix(setting)
-    for line in Path(".bazelrc").read_text().splitlines()
-    if line.startswith(prefix)
-    for token in shlex.split(line)
-    if token.startswith(setting)
-]
-if len(values) != 1:
-    raise SystemExit(f"expected one CUDA {sys.argv[1]} target list in JAX .bazelrc, got {values}")
-targets = [target.split("_", 1)[1] for target in values[0].split(",")]
-Path(sys.argv[2]).write_text(json.dumps([target[:-1] + "." + target[-1] for target in targets]) + "\n")
-PY
-
 python3 build/build.py build \
   --wheels=jax-cuda-pjrt \
   --cuda_major_version="$CUDA_MAJOR_VERSION" \
