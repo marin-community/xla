@@ -18,6 +18,8 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h"
+
 #if NCCL_VERSION_CODE >= 22900
 #include "third_party/nccl/nccl_device.h"
 #endif
@@ -163,10 +165,11 @@ __device__ void RaggedAllToAllCopy(
   }
 }
 
-// The grid is bounded by the SM count. Allow the compiler to use registers
-// for one resident CTA per SM rather than conserve them for higher occupancy.
+// The minimum is given so the compiler spends registers on the thread rather
+// than on occupancy; one CTA per SM is all the grid needs.
 template <int64_t kVectorSize>
-__global__ void __launch_bounds__(512, 1) RaggedAllToAllDeviceKernelImpl(
+__global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta, 1)
+    RaggedAllToAllDeviceKernelImpl(
     struct ncclDevComm dev_comm, ncclWindow_t send_win, ncclWindow_t recv_win,
     const int64_t* __restrict__ input_offsets_ptr,
     const int64_t* __restrict__ send_sizes_ptr,
