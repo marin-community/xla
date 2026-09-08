@@ -124,8 +124,7 @@ jobs:
           JAX_COMMIT=$(jq -r .jax_commit "$RELEASE_CONFIG")
           JAX_VERSION=$(jq -r .jax_version "$RELEASE_CONFIG")
           BAZEL_JOBS=$(jq -r .bazel_jobs "$RELEASE_CONFIG")
-          CUDA_COMPUTE_CAPABILITIES=$(jq -r .cuda_compute_capabilities "$RELEASE_CONFIG")
-          export JAX_COMMIT JAX_VERSION BAZEL_JOBS CUDA_COMPUTE_CAPABILITIES
+          export JAX_COMMIT JAX_VERSION BAZEL_JOBS
           bash marin/build_pjrt.sh
 
       - name: Identify the wheel
@@ -204,7 +203,7 @@ jobs:
               source: {fork_commit: $fork_commit, upstream_base: $upstream_base},
               jax: {commit: $jax_commit, version: $jax_version},
               wheel: {filename: $filename, sha256: $sha256, version: $version,
-                      architecture: "aarch64", sm_targets: ["10.0"]}}' \
+                      architecture: "aarch64"}}' \
             > candidate/marin-xla-pjrt-candidate.json
           cat candidate/marin-xla-pjrt-candidate.json
 

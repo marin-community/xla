@@ -13,7 +13,7 @@
 #
 # usage: XLA_SOURCE=<path> JAX_COMMIT=<sha> JAX_VERSION=<version> \
 #        MARIN_XLA_COMMIT=<sha> MARIN_EXPECT_VERSION=<version> OUT_DIR=<path> \
-#        [CUDA_COMPUTE_CAPABILITIES=sm_100] [BAZEL_JOBS=4] build_pjrt.sh
+#        [BAZEL_JOBS=4] build_pjrt.sh
 set -euo pipefail
 
 XLA_SOURCE="${XLA_SOURCE:?set XLA_SOURCE (path to this XLA checkout)}"
@@ -22,7 +22,6 @@ JAX_VERSION="${JAX_VERSION:?set JAX_VERSION (the stock sibling generation)}"
 MARIN_XLA_COMMIT="${MARIN_XLA_COMMIT:?set MARIN_XLA_COMMIT (the fork tip being built)}"
 MARIN_EXPECT_VERSION="${MARIN_EXPECT_VERSION:?set MARIN_EXPECT_VERSION (the version the preflight computed)}"
 OUT_DIR="${OUT_DIR:?set OUT_DIR}"
-CUDA_COMPUTE_CAPABILITIES="${CUDA_COMPUTE_CAPABILITIES:-sm_100}"
 BAZEL_JOBS="${BAZEL_JOBS:-4}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 CUDA_MAJOR_VERSION="${CUDA_MAJOR_VERSION:-13}"
@@ -80,7 +79,6 @@ python3 build/build.py build \
   --wheels=jax-cuda-pjrt \
   --cuda_major_version="$CUDA_MAJOR_VERSION" \
   --python_version="$PYTHON_VERSION" \
-  --cuda_compute_capabilities="$CUDA_COMPUTE_CAPABILITIES" \
   --local_xla_path="$XLA_SOURCE" \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
