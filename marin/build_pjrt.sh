@@ -63,7 +63,7 @@ echo "jax:  $(git -C "$jax_dir" rev-parse HEAD)"
 # healthy and benchmarks as a null result, which is indistinguishable from the change not helping.
 # Both halves are checked: the device kernel itself, and the grid it is launched on. Sentinels are
 # symbols and expressions the fork owns, so they have to move whenever that code is reworked.
-if ! grep -q "kRaggedAllToAllDeviceKernelCtasPerSm" \
+if ! grep -q "kRaggedAllToAllDeviceKernelThreadsPerCta" \
     "$XLA_SOURCE/xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h"; then
   echo "XLA checkout does not carry the ragged a2a device kernel." >&2
   exit 1
