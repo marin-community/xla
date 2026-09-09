@@ -51,6 +51,36 @@ work="${WORK_DIR:-$(mktemp -d)}"
 mkdir -p "$work"
 jax_dir="$work/jax"
 
+# The pinned rules_ml_toolchain distribution table stops at NCCL 2.30.7.
+# Supply the checksum-pinned 2.31.2 distribution through its local-path API.
+nccl_bazel_options=()
+if [ "$HERMETIC_NCCL_VERSION" = "2.31.2" ]; then
+  if [ "$CUDA_MAJOR_VERSION" != "13" ]; then
+    echo "The NCCL 2.31.2 distribution is pinned for CUDA 13." >&2
+    exit 1
+  fi
+  case "$(uname -m)" in
+    aarch64)
+      nccl_wheel_url=https://files.pythonhosted.org/packages/52/a0/530efd7db8857c0436868bb7df9764f09fde2bd4d1f0bae546eec9fc40d0/nvidia_nccl_cu13-2.31.2-py3-none-manylinux_2_18_aarch64.whl
+      nccl_wheel_sha256=b5563f8e2534f363d93ace022670ba016d3717e190ac4eba564d05fbbe8495b1
+      ;;
+    x86_64)
+      nccl_wheel_url=https://files.pythonhosted.org/packages/14/fb/94933e00bb3dcfdf66ea3456739c6a51d322353f7cc64fa1f5f660e695ac/nvidia_nccl_cu13-2.31.2-py3-none-manylinux_2_18_x86_64.whl
+      nccl_wheel_sha256=0bcaf0308854cb55fcc35af72e2c83143f3b71e65a4e865e2c586b1cdcdb5ae0
+      ;;
+    *)
+      echo "No pinned NCCL 2.31.2 distribution for $(uname -m)." >&2
+      exit 1
+      ;;
+  esac
+  nccl_dir="$work/nccl-2.31.2"
+  mkdir -p "$nccl_dir"
+  curl --fail --location --retry 3 "$nccl_wheel_url" -o "$nccl_dir/nccl.whl"
+  printf '%s  %s\n' "$nccl_wheel_sha256" "$nccl_dir/nccl.whl" | sha256sum --check
+  unzip -oq "$nccl_dir/nccl.whl" 'nvidia/nccl/*' -d "$nccl_dir"
+  nccl_bazel_options+=("--bazel_options=--repo_env=LOCAL_NCCL_PATH=$nccl_dir/nvidia/nccl")
+fi
+
 if [ ! -d "$jax_dir/.git" ]; then
   git clone --filter=blob:none https://github.com/jax-ml/jax.git "$jax_dir"
 fi
@@ -85,6 +115,7 @@ python3 build/build.py build \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
   --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$WHEEL_VERSION_SUFFIX" \
   --bazel_options=--repo_env=HERMETIC_NCCL_VERSION="$HERMETIC_NCCL_VERSION" \
+  "${nccl_bazel_options[@]}" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 
