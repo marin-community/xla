@@ -47,6 +47,7 @@ limitations under the License.
 #include "xla/tests/hlo_pjrt_interpreter_reference_mixin.h"
 #include "xla/tests/hlo_pjrt_test_base.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
@@ -120,6 +121,23 @@ TEST_F(RaggedDotFusionRewriterUnitTest, TestSupportedRaggedDot) {
               m::Fusion()
                   .WithFusionKind(HloInstruction::FusionKind::kCustom)
                   .WithShape(BF16, {128, 256}));
+}
+
+TEST_F(RaggedDotFusionRewriterUnitTest,
+       TestSupportedRaggedContractingDot) {
+  RunAndMatch(R"(
+    HloModule Test
+
+    ENTRY Test {
+      input = bf16[128,512]{1,0} parameter(0)
+      output_gradient = bf16[128,256]{1,0} parameter(1)
+      group_sizes = s32[16]{0} parameter(2)
+      ROOT rd = bf16[16,512,256]{2,1,0} ragged-dot(input, output_gradient, group_sizes),
+             lhs_contracting_dims={0}, rhs_contracting_dims={0}, lhs_ragged_dims={0}
+    })",
+              m::Fusion()
+                  .WithFusionKind(HloInstruction::FusionKind::kCustom)
+                  .WithShape(BF16, {16, 512, 256}));
 }
 
 // This class performs end-to-end integration testing of the RaggedDotRewriter.
@@ -196,6 +214,36 @@ TEST_P(RaggedDotFusionRewriterIntegrationTest, TestRaggedDotOnly) {
 
   TF_ASSERT_OK_AND_ASSIGN(auto module,
                           ParseAndReturnVerifiedModule(hlo_with_new_type));
+  DebugOptions debug_opts = module->config().debug_options();
+  debug_opts.set_xla_gpu_experimental_use_ragged_dot_fusion(true);
+  module->mutable_config().set_debug_options(debug_opts);
+  EXPECT_TRUE(RunAndCompare(std::move(module), ErrorSpec{0.01, 0.01}))
+      << optimized_hlo_string;
+}
+
+TEST_P(RaggedDotFusionRewriterIntegrationTest, TestRaggedWeightGradient) {
+  if (GetDnnVersion() < se::dnn::VersionInfo{9, 22, 0}) {
+    GTEST_SKIP() << "CuDNN ragged weight gradients require cuDNN 9.22+.";
+  }
+
+  const auto& [data_type, group_type] = GetParam();
+  const std::string hlo_with_new_type =
+      absl::StrReplaceAll(R"(
+    HloModule Test
+
+    ENTRY Test {
+      input = TYPE[128,512]{1,0} parameter(0)
+      output_gradient = TYPE[128,256]{1,0} parameter(1)
+      group_sizes = GROUP_TYPE[16]{0} constant({7,9,6,10,8,8,8,8,8,8,8,8,8,8,8,8})
+      ROOT rd = TYPE[16,512,256]{2,1,0} ragged-dot(input, output_gradient, group_sizes),
+             lhs_contracting_dims={0}, rhs_contracting_dims={0}, lhs_ragged_dims={0}
+    })",
+                          {{"TYPE", data_type}, {"GROUP_TYPE", group_type}});
+  std::string optimized_hlo_string = GetOptimizedHlo(hlo_with_new_type);
+  EXPECT_THAT(optimized_hlo_string, HasSubstr(kCuDnnFusionKind));
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_with_new_type));
   DebugOptions debug_opts = module->config().debug_options();
   debug_opts.set_xla_gpu_experimental_use_ragged_dot_fusion(true);
   module->mutable_config().set_debug_options(debug_opts);
