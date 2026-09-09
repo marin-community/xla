@@ -52,6 +52,7 @@ limitations under the License.
 #include "xla/service/executable.h"
 #include "xla/service/gpu/autotuning/redzone_buffers.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
 #include "xla/service/gpu/stream_executor_util.h"
@@ -145,6 +146,12 @@ static absl::Status InitializeInputBuffer(GpuInputBuffers& gpu_buffers,
   return absl::OkStatus();
 }
 
+static bool IsTritonRaggedDotFusion(const HloInstruction* instr) {
+  auto gpu_config = instr->backend_config<GpuBackendConfig>();
+  return gpu_config.ok() &&
+         gpu_config->fusion_backend_config().kind() == kTritonGemmFusionKind;
+}
+
 // Initialize input buffers based on the operation type.
 // This function examines the HLO instruction and initializes
 // specific input buffers based on the operation's requirements.
@@ -161,7 +168,11 @@ static absl::Status InitializeBuffersIfRequiredByOpcode(
   // balanced constant in the ENTRY computation, but the KERNEL still reads
   // from arg[2]. Initialize buffer 2 with balanced GS values so the kernel
   // computes correct start_m and m_loop_count instead of using random data.
-  if (instr->opcode() == HloOpcode::kFusion && instr->operand_count() >= 3) {
+  // Only the Triton ragged-dot fusion reads group sizes from its third operand. A cuDNN
+  // ragged-dot fusion also wraps a kRaggedDot with three operands, but its third operand is the
+  // group start offsets and its buffers are not laid out for this initialization.
+  if (instr->opcode() == HloOpcode::kFusion && instr->operand_count() >= 3 &&
+      IsTritonRaggedDotFusion(instr)) {
     const HloComputation* fc = instr->fused_instructions_computation();
     bool found_ragged_dot = false;
     for (const HloInstruction* fi : fc->instructions()) {
