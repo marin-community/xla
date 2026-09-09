@@ -50,6 +50,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -603,6 +604,54 @@ TEST_F(RecomputeAndCompressHloRematerializationTest, CopyNotRematerialized) {
   EXPECT_TRUE(changed);
 
   EXPECT_EQ(count_copies(entry_computation), 1);
+  CheckForRematInInstructionNames(
+      ::testing::UnitTest::GetInstance()->current_test_info()->name());
+}
+
+TEST_F(RecomputeAndCompressHloRematerializationTest,
+       CustomFusionNotRematerialized) {
+  constexpr absl::string_view hlo_string = R"(
+HloModule custom_fusion
+
+custom_fusion_computation {
+  parameter = f32[1024]{0} parameter(0)
+  ROOT negate = f32[1024]{0} negate(parameter)
+}
+
+ENTRY entry {
+  parameter = f32[] parameter(0)
+  broadcast = f32[1024]{0} broadcast(parameter), dimensions={}
+  custom_fusion = f32[1024]{0} fusion(broadcast), kind=kCustom,
+    calls=custom_fusion_computation
+  negate_a_1 = f32[1024]{0} negate(custom_fusion)
+  negate_a_2 = f32[1024]{0} negate(negate_a_1)
+  negate_b_1 = f32[1024]{0} negate(custom_fusion)
+  negate_b_2 = f32[1024]{0} negate(negate_b_1)
+  ROOT tuple = (f32[1024]{0}, f32[1024]{0}) tuple(negate_a_2, negate_b_2)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  HloComputation* entry_computation = module->entry_computation();
+  auto count_custom_fusions = [](const HloComputation* computation) {
+    int64_t count = 0;
+    for (const HloInstruction* instruction : computation->instructions()) {
+      if (instruction->opcode() == HloOpcode::kFusion &&
+          instruction->fusion_kind() ==
+              HloInstruction::FusionKind::kCustom) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  ASSERT_EQ(count_custom_fusions(entry_computation), 1);
+
+  ASSERT_OK_AND_ASSIGN(bool changed,
+                       RunHloRematerialization(
+                           /*memory_limit_bytes=*/1 * 1024, module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_EQ(count_custom_fusions(entry_computation), 1);
   CheckForRematInInstructionNames(
       ::testing::UnitTest::GetInstance()->current_test_info()->name());
 }

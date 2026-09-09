@@ -101,6 +101,16 @@ bool IsRematerializable(const HloInstruction* instruction) {
     return !collective->constrain_layout();
   }
 
+  // A custom fusion is a library kernel behind a fusion boundary (a cuDNN
+  // graph, a Triton GEMM): the analogue of a custom call, which is never
+  // rematerialized below. Recomputing one to free its output buys memory at
+  // the price of a whole GEMM, a trade the pass makes for cheap elementwise
+  // work but which here costs more than the buffer is worth.
+  if (instruction->opcode() == HloOpcode::kFusion &&
+      instruction->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+    return false;
+  }
+
   // Don't rematerialize instructions with side effects or instructions which
   // cannot be cloned safely.
   switch (instruction->opcode()) {
