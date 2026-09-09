@@ -330,11 +330,11 @@ absl::Status TritonBackend::ApplyConfig(HloInstruction& instr,
     const bool is_batch_apply =
         absl::c_count(dot_dims.lhs_batch_dimensions(), lhs_ragged_dim) > 0;
 
-    BlockLevelFusionConfig* blk_cfg =
+    xtile::BlockLevelFusionConfig* blk_cfg =
         backend_config.mutable_block_level_fusion_config();
     blk_cfg->clear_output_tiles();
     auto* output_tile = blk_cfg->add_output_tiles();
-    Tile inner_tile;
+    xtile::Tile inner_tile;
 
     if (is_batch_apply) {
       // kRaggedBatch: parallel dims = [B=1, M, N].
