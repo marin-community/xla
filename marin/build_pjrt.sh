@@ -25,6 +25,7 @@ OUT_DIR="${OUT_DIR:?set OUT_DIR}"
 BAZEL_JOBS="${BAZEL_JOBS:-4}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 CUDA_MAJOR_VERSION="${CUDA_MAJOR_VERSION:-13}"
+HERMETIC_NCCL_VERSION="${HERMETIC_NCCL_VERSION:-2.30.7}"
 
 XLA_SOURCE="$(cd "$XLA_SOURCE" && pwd)"
 mkdir -p "$OUT_DIR"
@@ -83,6 +84,7 @@ python3 build/build.py build \
   --bazel_options=--jobs="$BAZEL_JOBS" \
   --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
   --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$WHEEL_VERSION_SUFFIX" \
+  --bazel_options=--repo_env=HERMETIC_NCCL_VERSION="$HERMETIC_NCCL_VERSION" \
   --bazel_options=--define=ynn_enable_arm64_neonfp8=false \
   --verbose
 
