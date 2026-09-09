@@ -267,9 +267,13 @@ class RaggedDotDimensionAdapter {
       operand_idx = ragged_dot_.operand_index(&hlo);
     }
     if (IsContracting() && is_output) {
-      // weight gradient [G, K, N]
-      fixed_dims = {dims[0], dims[1], dims[2]};
-      fixed_strides = {strides[0], strides[1], strides[2]};
+      // weight gradient [G, K, N]. cuDNN's MoE grouped matmul backward writes
+      // its result per expert in column-major order, so the fusion computes
+      // the transposed product with the operands swapped (see the graph
+      // construction below): a [G, N, K] result whose column-major storage is
+      // this row-major [G, K, N] buffer.
+      fixed_dims = {dims[0], dims[2], dims[1]};
+      fixed_strides = {strides[0], strides[2], strides[1]};
     } else if (IsContracting() && (operand_idx == 0 || operand_idx == 1)) {
       // token [M, K] and output gradient [M, N], both ragged along M
       fixed_dims = {1, dims[0], dims[1]};
@@ -1048,12 +1052,15 @@ absl::StatusOr<se::gpu::CudnnGraph> HloFusionToCuDnnGraph(
                          " in instruction: ", hlo->ToString()));
       }
       if (ragged_dot_adapter->IsContracting()) {
-        // dweight = token^T @ doutput, grouped by the row offsets.
+        // dweight[g] = lhs_g^T @ rhs_g, grouped by the row offsets. The node
+        // computes token^T @ doutput into a column-major result, so passing
+        // the operands swapped yields rhs^T @ lhs = dweight^T, which in
+        // column-major storage is the row-major dweight XLA expects.
         auto moe_grouped_matmul_bwd_attr =
             graph::Moe_grouped_matmul_bwd_attributes().set_compute_data_type(
                 compute_dtype.value());
         hlo_to_cudnn[hlo] = graph.moe_grouped_matmul_bwd(
-            /*doutput=*/operand(1), /*token=*/operand(0),
+            /*doutput=*/operand(0), /*token=*/operand(1),
             /*first_token_offset=*/operand(2), moe_grouped_matmul_bwd_attr);
       } else {
         auto moe_grouped_matmul_attr =
