@@ -239,6 +239,16 @@ class RaggedDotDimensionAdapter {
     return RaggedDotDimensionAdapter{*maybe_ragged_dot, dnums};
   }
 
+  // The ragged dimension is contracted: the weight gradient ``[G, K, N] =
+  // lhs[M, K]^T @ rhs[M, N]`` grouped over the rows of both operands, which
+  // cuDNN computes with its MoE grouped matmul backward.
+  bool IsContracting() const {
+    const int64_t lhs_ragged_dim = dums_.lhs_ragged_dimensions(0);
+    return absl::c_linear_search(
+        dums_.dot_dimension_numbers().lhs_contracting_dimensions(),
+        lhs_ragged_dim);
+  }
+
   std::optional<Result> DimensionsAndStrides(const HloInstruction& hlo) {
     // placeholder FP32 data type here, it is not used
     auto desc = se::dnn::TensorDescriptor::For(
@@ -256,7 +266,15 @@ class RaggedDotDimensionAdapter {
     if (!is_output) {
       operand_idx = ragged_dot_.operand_index(&hlo);
     }
-    if (is_output || operand_idx == 0) {
+    if (IsContracting() && is_output) {
+      // weight gradient [G, K, N]
+      fixed_dims = {dims[0], dims[1], dims[2]};
+      fixed_strides = {strides[0], strides[1], strides[2]};
+    } else if (IsContracting() && (operand_idx == 0 || operand_idx == 1)) {
+      // token [M, K] and output gradient [M, N], both ragged along M
+      fixed_dims = {1, dims[0], dims[1]};
+      fixed_strides = {dims[0] * strides[0], strides[0], strides[1]};
+    } else if (is_output || operand_idx == 0) {
       // input & output
       fixed_dims = {1, dims[0], dims[1]};
       fixed_strides = {dims[0] * strides[0], strides[0], strides[1]};
@@ -1029,14 +1047,24 @@ absl::StatusOr<se::gpu::CudnnGraph> HloFusionToCuDnnGraph(
                          PrimitiveType_Name(hlo->shape().element_type()),
                          " in instruction: ", hlo->ToString()));
       }
-      auto moe_grouped_matmul_attr =
-          graph::Moe_grouped_matmul_attributes()
-              .set_mode(fe::MoeGroupedMatmulMode_t::NONE)
-              .set_compute_data_type(compute_dtype.value())
-              .set_top_k(1);
-      hlo_to_cudnn[hlo] =
-          graph.moe_grouped_matmul(operand(0), operand(1), operand(2), nullptr,
-                                   nullptr, moe_grouped_matmul_attr);
+      if (ragged_dot_adapter->IsContracting()) {
+        // dweight = token^T @ doutput, grouped by the row offsets.
+        auto moe_grouped_matmul_bwd_attr =
+            graph::Moe_grouped_matmul_bwd_attributes().set_compute_data_type(
+                compute_dtype.value());
+        hlo_to_cudnn[hlo] = graph.moe_grouped_matmul_bwd(
+            /*doutput=*/operand(1), /*token=*/operand(0),
+            /*first_token_offset=*/operand(2), moe_grouped_matmul_bwd_attr);
+      } else {
+        auto moe_grouped_matmul_attr =
+            graph::Moe_grouped_matmul_attributes()
+                .set_mode(fe::MoeGroupedMatmulMode_t::NONE)
+                .set_compute_data_type(compute_dtype.value())
+                .set_top_k(1);
+        hlo_to_cudnn[hlo] = graph.moe_grouped_matmul(
+            operand(0), operand(1), operand(2), nullptr, nullptr,
+            moe_grouped_matmul_attr);
+      }
     } else if (HloPredicateIsOp<HloOpcode::kReduce>(hlo)) {
       hlo_to_cudnn[hlo] = graph.reduction(
           operand(0), graph::Reduction_attributes()

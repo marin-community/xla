@@ -371,7 +371,11 @@ bool CanBeHandledByCuDNNFusion(const HloInstruction* instruction) {
   int lhs_ragged_dim = ragged_dims.lhs_ragged_dimensions(0);
   RaggedDotMode mode =
       GetRaggedDotMode(lhs_ragged_dim, ragged_dims.dot_dimension_numbers());
-  return mode == RaggedDotMode::kRaggedNonContracting;
+  // cuDNN's MoE grouped matmul covers the token-major product (the forward and
+  // the activation gradient) and, from cuDNN 9.22, its backward: the weight
+  // gradient that contracts over the ragged token dimension.
+  return mode == RaggedDotMode::kRaggedNonContracting ||
+         mode == RaggedDotMode::kRaggedContracting;
 }
 
 bool CanBeHandledByGpublasltGroupGemm(
