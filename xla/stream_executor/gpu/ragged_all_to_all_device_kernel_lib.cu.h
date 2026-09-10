@@ -70,8 +70,76 @@ __device__ bool LoadRaggedAllToAllUpdateMetadata(
   return true;
 }
 
-// Policies: 0/1 use the original vector loop, 2/3 unroll four vectors, 4/5 unroll
-// eight vectors. Odd policies visit peers relative to the sender, self last.
+#if __CUDA_ARCH__ >= 900
+// Four warp leaders stream through separate buffers. Read completion permits
+// buffer reuse; full completion before return makes remote stores visible to
+// the subsequent NCCL release barrier.
+__device__ __forceinline__ void RaggedAllToAllBulkCopy(const DeviceVec<16>* src,
+                                                       DeviceVec<16>* dst,
+                                                       int64_t lo, int64_t hi) {
+  constexpr int kStreams = 4;
+  constexpr int kChunkBytes = 8192;
+  constexpr int kChunkElements = kChunkBytes / 16;
+  __shared__ __align__(16) uint8_t buffers[kStreams][kChunkBytes];
+  __shared__ __align__(8) uint64_t barriers[kStreams];
+  const int warp = threadIdx.x / 32;
+  if (threadIdx.x % 32 == 0 && warp < kStreams) {
+    const uint32_t buffer =
+        static_cast<uint32_t>(__cvta_generic_to_shared(buffers[warp]));
+    const uint32_t barrier =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&barriers[warp]));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier)
+                 : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    uint32_t phase = 0;
+    for (int64_t offset = lo + warp * kChunkElements; offset < hi;
+         offset += kStreams * kChunkElements) {
+      const int64_t remaining = hi - offset;
+      const uint32_t bytes = static_cast<uint32_t>(
+          (remaining < kChunkElements ? remaining : kChunkElements) * 16);
+      asm volatile(
+          "{ .reg .b64 state; "
+          "mbarrier.arrive.expect_tx.shared::cta.b64 state, [%0], %1; }" ::"r"(
+              barrier),
+          "r"(bytes)
+          : "memory");
+      asm volatile(
+          "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+          "[%0], [%1], %2, [%3];" ::"r"(buffer),
+          "l"(src + offset), "r"(bytes), "r"(barrier)
+          : "memory");
+      uint32_t complete;
+      do {
+        asm volatile(
+            "{ .reg .pred ready; "
+            "mbarrier.try_wait.parity.shared::cta.b64 ready, [%1], %2; "
+            "selp.u32 %0, 1, 0, ready; }"
+            : "=r"(complete)
+            : "r"(barrier), "r"(phase)
+            : "memory");
+      } while (!complete);
+      phase ^= 1;
+      asm volatile(
+          "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(
+              dst + offset),
+          "r"(buffer), "r"(bytes)
+          : "memory");
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+      // Keep at most one remote write outstanding while loading the next tile.
+      asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+    }
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(barrier)
+                 : "memory");
+  }
+  __syncthreads();
+}
+#endif  // __CUDA_ARCH__ >= 900
+
+// Policies: 0/1 use the original vector loop, 2/3 unroll four vectors, 4/5
+// unroll eight vectors, and 6/7 use bulk copies for 16-byte vectors. Odd
+// policies visit peers relative to the sender, self last.
 template <int64_t kVectorSize, int kCopyPolicy>
 __device__ void RaggedAllToAllCopy(
     ncclWindow_t send_win, ncclWindow_t recv_win,
@@ -139,6 +207,16 @@ __device__ void RaggedAllToAllCopy(
             ncclGetLocalPointer(send_win, meta.src_byte_offset));
         T* dst = static_cast<T*>(
             ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
+#if __CUDA_ARCH__ >= 900
+        if constexpr (kCopyPolicy >= 6 && kVectorSize == 16) {
+          if ((reinterpret_cast<uintptr_t>(src) % 16 == 0) &&
+              (reinterpret_cast<uintptr_t>(dst) % 16 == 0)) {
+            RaggedAllToAllBulkCopy(src, dst, lo, hi);
+            update_begin = update_end;
+            continue;
+          }
+        }
+#endif
         if constexpr (kCopyPolicy < 2) {
           for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
                i += static_cast<int64_t>(blockDim.x)) {

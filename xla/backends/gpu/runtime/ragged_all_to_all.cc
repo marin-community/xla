@@ -273,9 +273,15 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     int policy = 0;
     CHECK(value == nullptr || absl::SimpleAtoi(value, &policy));
     CHECK_GE(policy, 0);
-    CHECK_LE(policy, 5);
+    CHECK_LE(policy, 7);
     return policy;
   }();
+  if (copy_policy >= 6 && !executor->GetDeviceDescription()
+                               .cuda_compute_capability()
+                               .IsAtLeastHopper()) {
+    return absl::UnimplementedError(
+        "RASM bulk-copy policies require SM90 or newer");
+  }
   LOG_FIRST_N(INFO, 1) << "RASM_GEOMETRY ctas=" << cta_count
                        << " threads=" << threads_per_cta
                        << " copy_policy=" << copy_policy;
@@ -315,6 +321,10 @@ absl::Status RunDeviceRaggedAllToAllKernel(
           return launch_policy(std::integral_constant<int, 4>{});
         case 5:
           return launch_policy(std::integral_constant<int, 5>{});
+        case 6:
+          return launch_policy(std::integral_constant<int, 6>{});
+        case 7:
+          return launch_policy(std::integral_constant<int, 7>{});
         default:
           return absl::InvalidArgumentError("Invalid RASM copy policy");
       }
