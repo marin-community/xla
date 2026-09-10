@@ -221,7 +221,7 @@ absl::Status RunRaggedAllToAllWithSymmetricMemoryKernel(
 
 namespace {
 
-template <int64_t kVectorSize, int kThreadsPerCta>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCopyPolicy>
 absl::Status LaunchDeviceKernel(
     se::Stream* stream, se::StreamExecutor* executor,
     const se::ThreadDim& thread_dims, const se::BlockDim& block_dims,
@@ -232,7 +232,8 @@ absl::Status LaunchDeviceKernel(
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
   using KernelTrait =
-      se::gpu::RaggedAllToAllDeviceKernel<kVectorSize, kThreadsPerCta>;
+      se::gpu::RaggedAllToAllDeviceKernel<kVectorSize, kThreadsPerCta,
+                                          kCopyPolicy>;
 
   ABSL_ASSIGN_OR_RETURN(
       auto kernel,
@@ -267,8 +268,17 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     }
     return threads;
   }();
+  static const int copy_policy = [] {
+    const char* value = std::getenv("RASM_COPY_POLICY");
+    int policy = 0;
+    CHECK(value == nullptr || absl::SimpleAtoi(value, &policy));
+    CHECK_GE(policy, 0);
+    CHECK_LE(policy, 5);
+    return policy;
+  }();
   LOG_FIRST_N(INFO, 1) << "RASM_GEOMETRY ctas=" << cta_count
-                       << " threads=" << threads_per_cta;
+                       << " threads=" << threads_per_cta
+                       << " copy_policy=" << copy_policy;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
@@ -283,12 +293,31 @@ absl::Status RunDeviceRaggedAllToAllKernel(
 
   auto launch = [&](auto type) -> absl::Status {
     auto launch_width = [&](auto width) -> absl::Status {
-      return LaunchDeviceKernel<decltype(type)::value, decltype(width)::value>(
-          stream, executor, thread_dims, block_dims, dev_comm, send_win,
-          recv_win, input_offsets_buffer, send_sizes_buffer,
-          output_offsets_buffer, num_updates_per_replica,
-          num_vectorized_row_elements, input_buffer_offset_bytes,
-          output_buffer_offset_bytes);
+      auto launch_policy = [&](auto policy) -> absl::Status {
+        return LaunchDeviceKernel<decltype(type)::value, decltype(width)::value,
+                                  decltype(policy)::value>(
+            stream, executor, thread_dims, block_dims, dev_comm, send_win,
+            recv_win, input_offsets_buffer, send_sizes_buffer,
+            output_offsets_buffer, num_updates_per_replica,
+            num_vectorized_row_elements, input_buffer_offset_bytes,
+            output_buffer_offset_bytes);
+      };
+      switch (copy_policy) {
+        case 0:
+          return launch_policy(std::integral_constant<int, 0>{});
+        case 1:
+          return launch_policy(std::integral_constant<int, 1>{});
+        case 2:
+          return launch_policy(std::integral_constant<int, 2>{});
+        case 3:
+          return launch_policy(std::integral_constant<int, 3>{});
+        case 4:
+          return launch_policy(std::integral_constant<int, 4>{});
+        case 5:
+          return launch_policy(std::integral_constant<int, 5>{});
+        default:
+          return absl::InvalidArgumentError("Invalid RASM copy policy");
+      }
     };
     switch (threads_per_cta) {
       case 128:

@@ -70,7 +70,9 @@ __device__ bool LoadRaggedAllToAllUpdateMetadata(
   return true;
 }
 
-template <int64_t kVectorSize>
+// Policies: 0/1 use the original vector loop, 2/3 unroll four vectors, 4/5 unroll
+// eight vectors. Odd policies visit peers relative to the sender, self last.
+template <int64_t kVectorSize, int kCopyPolicy>
 __device__ void RaggedAllToAllCopy(
     ncclWindow_t send_win, ncclWindow_t recv_win,
     const int64_t* __restrict__ input_offsets_ptr,
@@ -109,11 +111,20 @@ __device__ void RaggedAllToAllCopy(
     int64_t update_begin = 0;
     for (int64_t update = 0; update < num_lsa_updates && update_begin < cta_end;
          ++update) {
+      int64_t metadata_update = update;
+      if constexpr (kCopyPolicy % 2 == 1) {
+        const int64_t peer = update / num_updates_per_replica;
+        const int64_t slot = update % num_updates_per_replica;
+        const int64_t rotated_peer =
+            (peer + world.rank - start_lsa + 1) % lsa_size;
+        metadata_update = rotated_peer * num_updates_per_replica + slot;
+      }
       RaggedAllToAllUpdateMetadata<kVectorSize> meta;
       if (!LoadRaggedAllToAllUpdateMetadata<kVectorSize>(
-              meta_base + update, num_updates_per_replica, num_row_elements,
-              input_buffer_offset_bytes, output_buffer_offset_bytes,
-              input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
+              meta_base + metadata_update, num_updates_per_replica,
+              num_row_elements, input_buffer_offset_bytes,
+              output_buffer_offset_bytes, input_offsets_ptr, send_sizes_ptr,
+              output_offsets_ptr, &meta)) {
         continue;
       }
       const int64_t update_end = update_begin + meta.byte_count / kVectorSize;
@@ -122,14 +133,37 @@ __device__ void RaggedAllToAllCopy(
             cta_begin > update_begin ? cta_begin - update_begin : 0;
         const int64_t hi =
             (cta_end < update_end ? cta_end : update_end) - update_begin;
-        const int lsa_peer = static_cast<int>(update / num_updates_per_replica);
+        const int lsa_peer =
+            static_cast<int>(metadata_update / num_updates_per_replica);
         const T* src = static_cast<const T*>(
             ncclGetLocalPointer(send_win, meta.src_byte_offset));
         T* dst = static_cast<T*>(
             ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
-        for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
-             i += static_cast<int64_t>(blockDim.x)) {
-          dst[i] = src[i];
+        if constexpr (kCopyPolicy < 2) {
+          for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
+               i += static_cast<int64_t>(blockDim.x)) {
+            dst[i] = src[i];
+          }
+        } else {
+          // Separate independent loads from stores, as in NCCL tests' optimized
+          // NVLink all-to-all. Keep the original copy for the partial tail.
+          constexpr int kUnroll = kCopyPolicy < 4 ? 4 : 8;
+          const int64_t stride = static_cast<int64_t>(blockDim.x);
+          int64_t i = lo + static_cast<int64_t>(threadIdx.x);
+          for (; i + (kUnroll - 1) * stride < hi; i += kUnroll * stride) {
+            T values[kUnroll];
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) {
+              values[u] = src[i + u * stride];
+            }
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) {
+              dst[i + u * stride] = values[u];
+            }
+          }
+          for (; i < hi; i += stride) {
+            dst[i] = src[i];
+          }
         }
       }
       update_begin = update_end;
@@ -165,7 +199,7 @@ __device__ void RaggedAllToAllCopy(
 }
 
 // Compile each width with matching launch bounds.
-template <int64_t kVectorSize, int kThreadsPerCta>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCopyPolicy>
 __global__ void __launch_bounds__(kThreadsPerCta, 1)
     RaggedAllToAllDeviceKernelImpl(
         struct ncclDevComm dev_comm, ncclWindow_t send_win,
@@ -198,7 +232,7 @@ __global__ void __launch_bounds__(kThreadsPerCta, 1)
     bar.sync(ncclCoopCta(), ::cuda::memory_order_acquire,
              ncclGinFenceLevel::Relaxed);
 
-    RaggedAllToAllCopy<kVectorSize>(
+    RaggedAllToAllCopy<kVectorSize, kCopyPolicy>(
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
         output_offsets_ptr, num_updates_per_replica, num_row_elements,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
@@ -219,7 +253,7 @@ __global__ void __launch_bounds__(kThreadsPerCta, 1)
                                            ncclTeamTagLsa{}, blockIdx.x};
     bar.sync(ncclCoopCta(), ::cuda::memory_order_relaxed);
 
-    RaggedAllToAllCopy<kVectorSize>(
+    RaggedAllToAllCopy<kVectorSize, kCopyPolicy>(
         send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
         output_offsets_ptr, num_updates_per_replica, num_row_elements,
         input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
@@ -232,7 +266,7 @@ __global__ void __launch_bounds__(kThreadsPerCta, 1)
 
 #else  // NCCL_VERSION_CODE < 22900
 
-template <int64_t kVectorSize, int kThreadsPerCta>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCopyPolicy>
 __global__ void RaggedAllToAllDeviceKernelImpl(
     void* dev_comm, void* send_win, void* recv_win,
     const int64_t* input_offsets_ptr, const int64_t* send_sizes_ptr,

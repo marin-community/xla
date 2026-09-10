@@ -33,7 +33,7 @@ namespace stream_executor::gpu {
 // Research sweep: each width has its own compiler register budget.
 inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 128;
 
-template <int64_t kVectorSize, int kThreadsPerCta>
+template <int64_t kVectorSize, int kThreadsPerCta, int kCopyPolicy>
 struct RaggedAllToAllDeviceKernel {
   using KernelType = stream_executor::TypedKernel<
       xla::gpu::GpuDeviceCommunicator*,    // dev_comm
