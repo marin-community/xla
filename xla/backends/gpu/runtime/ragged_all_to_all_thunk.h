@@ -185,18 +185,9 @@ class RaggedAllToAllThunk : public CollectiveThunk {
     return config_.use_device_kernel && config_.config.use_symmetric_buffer;
   }
 
-  // One CTA per SM. Drives both the launch grid and the barrier registration:
-  // the kernel indexes its barriers by blockIdx.x, so the slots reserved when
-  // creating the device communicator must cover the launched grid. The copies
-  // are link-bound at these message sizes, so a wider grid buys little
-  // transport latency, and the kernel holds its CTAs for the whole transport
-  // including the barrier spins, which starves compute scheduled against it.
-  // Callers pass the SM count from se::DeviceDescription::core_count(); all
-  // participating ranks are expected to be homogeneous so every rank arrives
-  // at the same value.
-  static int32_t DeviceKernelCtaCount(int core_count) {
-    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
-  }
+  // All ranks use the same count for launch and barrier registration.
+  // RASM_CTA_COUNT=0 preserves the baseline SM-count grid.
+  static int32_t DeviceKernelCtaCount(int core_count);
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
       int core_count) const {

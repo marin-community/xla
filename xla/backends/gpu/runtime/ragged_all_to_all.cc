@@ -18,11 +18,13 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 #include "xla/core/collectives/symmetric_memory.h"
@@ -53,8 +55,10 @@ absl::Status LaunchTypedKernel(se::Stream* stream,
                                int64_t num_row_elements) {
   using KernelTrait = se::gpu::RaggedAllToAllKernel<kVectorSize>;
 
-  ABSL_ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()
-                                    .LoadKernel<KernelTrait>(stream->parent()));
+  ABSL_ASSIGN_OR_RETURN(
+      auto kernel,
+      se::gpu::GpuKernelRegistry::GetGlobalRegistry().LoadKernel<KernelTrait>(
+          stream->parent()));
 
   return kernel.Launch(thread_dims, block_dims, stream, input_buffer,
                        output_ptrs, input_offsets_buffer, send_sizes_buffer,
@@ -74,8 +78,10 @@ absl::Status LaunchTypedKernelWithSymmetricMemory(
   using KernelTrait =
       se::gpu::RaggedAllToAllWithSymmetricMemoryKernel<kVectorSize>;
 
-  ABSL_ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()
-                                    .LoadKernel<KernelTrait>(stream->parent()));
+  ABSL_ASSIGN_OR_RETURN(
+      auto kernel,
+      se::gpu::GpuKernelRegistry::GetGlobalRegistry().LoadKernel<KernelTrait>(
+          stream->parent()));
 
   return kernel.Launch(thread_dims, block_dims, stream, input_buffer,
                        output_ptrs_symmetric_memory, output_sym_offset,
@@ -215,7 +221,7 @@ absl::Status RunRaggedAllToAllWithSymmetricMemoryKernel(
 
 namespace {
 
-template <int64_t kVectorSize>
+template <int64_t kVectorSize, int kThreadsPerCta>
 absl::Status LaunchDeviceKernel(
     se::Stream* stream, se::StreamExecutor* executor,
     const se::ThreadDim& thread_dims, const se::BlockDim& block_dims,
@@ -225,10 +231,13 @@ absl::Status LaunchDeviceKernel(
     se::DeviceAddressBase output_offsets_buffer,
     int64_t num_updates_per_replica, int64_t num_row_elements,
     int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
-  using KernelTrait = se::gpu::RaggedAllToAllDeviceKernel<kVectorSize>;
+  using KernelTrait =
+      se::gpu::RaggedAllToAllDeviceKernel<kVectorSize, kThreadsPerCta>;
 
-  ABSL_ASSIGN_OR_RETURN(auto kernel, se::gpu::GpuKernelRegistry::GetGlobalRegistry()
-                                    .LoadKernel<KernelTrait>(executor));
+  ABSL_ASSIGN_OR_RETURN(
+      auto kernel,
+      se::gpu::GpuKernelRegistry::GetGlobalRegistry().LoadKernel<KernelTrait>(
+          executor));
 
   return kernel.Launch(thread_dims, block_dims, stream, dev_comm, send_win,
                        recv_win, input_offsets_buffer, send_sizes_buffer,
@@ -249,9 +258,17 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     int64_t cta_count, int64_t input_buffer_offset_bytes,
     int64_t output_buffer_offset_bytes) {
   se::StreamExecutor* executor = stream->parent();
-  // Must match the kernel's __launch_bounds__.
-  static constexpr size_t kThreadsPerCta =
-      se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta;
+  static const int threads_per_cta = [] {
+    const char* value = std::getenv("RASM_THREADS_PER_CTA");
+    int threads = se::gpu::kRaggedAllToAllDeviceKernelThreadsPerCta;
+    if ((value != nullptr && !absl::SimpleAtoi(value, &threads)) ||
+        (threads != 128 && threads != 256 && threads != 512)) {
+      LOG(FATAL) << "RASM_THREADS_PER_CTA must be 128, 256, or 512";
+    }
+    return threads;
+  }();
+  LOG_FIRST_N(INFO, 1) << "RASM_GEOMETRY ctas=" << cta_count
+                       << " threads=" << threads_per_cta;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
@@ -261,15 +278,28 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     vector_size_bytes *= 2;
   }
 
-  se::ThreadDim thread_dims(kThreadsPerCta, 1, 1);
+  se::ThreadDim thread_dims(threads_per_cta, 1, 1);
   se::BlockDim block_dims(cta_count, 1, 1);
 
   auto launch = [&](auto type) -> absl::Status {
-    return LaunchDeviceKernel<decltype(type)::value>(
-        stream, executor, thread_dims, block_dims, dev_comm, send_win, recv_win,
-        input_offsets_buffer, send_sizes_buffer, output_offsets_buffer,
-        num_updates_per_replica, num_vectorized_row_elements,
-        input_buffer_offset_bytes, output_buffer_offset_bytes);
+    auto launch_width = [&](auto width) -> absl::Status {
+      return LaunchDeviceKernel<decltype(type)::value, decltype(width)::value>(
+          stream, executor, thread_dims, block_dims, dev_comm, send_win,
+          recv_win, input_offsets_buffer, send_sizes_buffer,
+          output_offsets_buffer, num_updates_per_replica,
+          num_vectorized_row_elements, input_buffer_offset_bytes,
+          output_buffer_offset_bytes);
+    };
+    switch (threads_per_cta) {
+      case 128:
+        return launch_width(std::integral_constant<int, 128>{});
+      case 256:
+        return launch_width(std::integral_constant<int, 256>{});
+      case 512:
+        return launch_width(std::integral_constant<int, 512>{});
+      default:
+        return absl::InvalidArgumentError("Invalid RASM CTA width");
+    }
   };
 
   switch (vector_size_bytes) {

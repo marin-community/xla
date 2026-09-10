@@ -22,21 +22,33 @@ limitations under the License.
 
 #define SINGLE_ARG(...) __VA_ARGS__
 
-#define REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(VECTOR_SIZE)                 \
-  GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(                             \
-      RaggedAllToAllDeviceKernelCuda##VECTOR_SIZE##Bytes,                     \
-      SINGLE_ARG(                                                             \
-          stream_executor::gpu::RaggedAllToAllDeviceKernel<VECTOR_SIZE>),     \
-      stream_executor::cuda::kCudaPlatformId, ([](size_t arity) {             \
-        return stream_executor::KernelLoaderSpec::CreateInProcessSymbolSpec(  \
-            absl::bit_cast<void*>(&SINGLE_ARG(                                \
-                stream_executor::gpu::RaggedAllToAllDeviceKernelImpl<         \
-                    VECTOR_SIZE>)),                                           \
-            "ragged_all_to_all_device_kernel_" #VECTOR_SIZE "_bytes", arity); \
+#define REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(VECTOR_SIZE, THREADS)         \
+  GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(                              \
+      RaggedAllToAllDeviceKernelCuda##VECTOR_SIZE##Bytes##THREADS,             \
+      SINGLE_ARG(stream_executor::gpu::RaggedAllToAllDeviceKernel<VECTOR_SIZE, \
+                                                                  THREADS>),   \
+      stream_executor::cuda::kCudaPlatformId, ([](size_t arity) {              \
+        return stream_executor::KernelLoaderSpec::CreateInProcessSymbolSpec(   \
+            absl::bit_cast<void*>(&SINGLE_ARG(                                 \
+                stream_executor::gpu::RaggedAllToAllDeviceKernelImpl<          \
+                    VECTOR_SIZE, THREADS>)),                                   \
+            "ragged_all_to_all_device_kernel_" #VECTOR_SIZE "_bytes_" #THREADS \
+            "_threads",                                                        \
+            arity);                                                            \
       }));
 
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(1);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(2);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(4);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(8);
-REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(16);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(1, 128);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(2, 128);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(4, 128);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(8, 128);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(16, 128);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(1, 256);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(2, 256);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(4, 256);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(8, 256);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(16, 256);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(1, 512);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(2, 512);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(4, 512);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(8, 512);
+REGISTER_RAGGED_ALL_TO_ALL_DEVICE_KERNEL(16, 512);

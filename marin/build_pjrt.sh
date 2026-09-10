@@ -69,8 +69,8 @@ if ! grep -q "kRaggedAllToAllDeviceKernelThreadsPerCta" \
   echo "XLA checkout does not carry the ragged a2a device kernel." >&2
   exit 1
 fi
-if ! grep -q "std::max<int32_t>(core_count, kMinDeviceKernelCtaCount)" \
-    "$XLA_SOURCE/xla/backends/gpu/runtime/ragged_all_to_all_thunk.h"; then
+if ! grep -q "RASM_CTA_COUNT" \
+    "$XLA_SOURCE/xla/backends/gpu/runtime/ragged_all_to_all_thunk.cc"; then
   echo "XLA checkout does not carry the ragged a2a device-kernel grid delta." >&2
   exit 1
 fi
