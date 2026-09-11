@@ -137,8 +137,23 @@ __device__ void RaggedAllToAllCopy(
             ncclGetLocalPointer(send_win, meta.src_byte_offset));
         T* dst = static_cast<T*>(
             ncclGetLsaPointer(recv_win, meta.dst_byte_offset, lsa_peer));
-        for (int64_t i = lo + static_cast<int64_t>(threadIdx.x); i < hi;
-             i += static_cast<int64_t>(blockDim.x)) {
+        // Issue independent loads before their stores to increase outstanding
+        // memory requests. Keep the vector loop for a partial batch.
+        constexpr int kUnroll = 8;
+        const int64_t stride = static_cast<int64_t>(blockDim.x);
+        int64_t i = lo + static_cast<int64_t>(threadIdx.x);
+        for (; i + (kUnroll - 1) * stride < hi; i += kUnroll * stride) {
+          T values[kUnroll];
+#pragma unroll
+          for (int u = 0; u < kUnroll; ++u) {
+            values[u] = src[i + u * stride];
+          }
+#pragma unroll
+          for (int u = 0; u < kUnroll; ++u) {
+            dst[i + u * stride] = values[u];
+          }
+        }
+        for (; i < hi; i += stride) {
           dst[i] = src[i];
         }
       }
