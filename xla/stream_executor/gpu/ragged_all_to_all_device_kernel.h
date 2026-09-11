@@ -30,14 +30,9 @@ class GpuDeviceCommunicator;
 
 namespace stream_executor::gpu {
 
-// CTA width of the device kernel. The thunk launches one CTA per SM (see
-// RaggedAllToAllThunk::DeviceKernelCtaCount): the link, not the SM, is the
-// bottleneck at these message sizes, so a narrow CTA sustains the transport
-// and leaves the SM to compute scheduled against the kernel. The grid must
-// be co-resident, since CTA k on every rank spins in a cross-rank barrier
-// for CTA k on every other; one CTA per SM is resident under any register
-// allocation.
-inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 128;
+// Must match the host launch width and the device kernel's launch bounds.
+// The launch grid is capped separately by RaggedAllToAllThunk.
+inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 256;
 
 template <int64_t kVectorSize>
 struct RaggedAllToAllDeviceKernel {

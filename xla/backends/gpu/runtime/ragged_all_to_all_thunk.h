@@ -185,17 +185,13 @@ class RaggedAllToAllThunk : public CollectiveThunk {
     return config_.use_device_kernel && config_.config.use_symmetric_buffer;
   }
 
-  // One CTA per SM. Drives both the launch grid and the barrier registration:
-  // the kernel indexes its barriers by blockIdx.x, so the slots reserved when
-  // creating the device communicator must cover the launched grid. The copies
-  // are link-bound at these message sizes, so a wider grid buys little
-  // transport latency, and the kernel holds its CTAs for the whole transport
-  // including the barrier spins, which starves compute scheduled against it.
-  // Callers pass the SM count from se::DeviceDescription::core_count(); all
-  // participating ranks are expected to be homogeneous so every rank arrives
-  // at the same value.
+  // Limit communication to at most 32 SMs so concurrent GEMMs have more
+  // room to execute. The grid must be co-resident because each CTA waits on
+  // the corresponding CTA on every peer. Use the same count for the launch
+  // and communicator barrier allocation. Participating GPUs must have the
+  // same SM count; core_count comes from the executor's device description.
   static int32_t DeviceKernelCtaCount(int core_count) {
-    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
+    return std::min<int32_t>(core_count, kMaxDeviceKernelCtaCount);
   }
 
   GpuDeviceCommunicator::Requirements DeviceKernelLsaDevCommRequirements(
@@ -245,10 +241,7 @@ class RaggedAllToAllThunk : public CollectiveThunk {
 
   const RaggedAllToAllConfig config_;
 
-  // Floor on the launch grid; it only binds on a device with fewer SMs than
-  // this. The grid is otherwise the executor's SM count, via
-  // DeviceKernelCtaCount() at Prepare / Initialize / Run time.
-  static constexpr int32_t kMinDeviceKernelCtaCount = 8;
+  static constexpr int32_t kMaxDeviceKernelCtaCount = 32;
 
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<se::StreamExecutor*,
