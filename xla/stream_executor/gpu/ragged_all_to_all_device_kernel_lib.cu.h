@@ -87,7 +87,7 @@ __device__ void RaggedAllToAllCopy(
     // [total*k/grid, total*(k+1)/grid), walking update boundaries as needed.
     // This keeps CTA work balanced regardless of how transferred bytes are
     // distributed across updates. Every CTA scans the update-size array,
-    // then walks updates in peer-major order to locate its range.
+    // then walks updates in sender-relative peer order to locate its range.
     const int64_t grid = static_cast<int64_t>(gridDim.x);
     const int64_t num_lsa_updates =
         static_cast<int64_t>(lsa_size) * num_updates_per_replica;
@@ -109,11 +109,20 @@ __device__ void RaggedAllToAllCopy(
     int64_t update_begin = 0;
     for (int64_t update = 0;
          update < num_lsa_updates && update_begin < cta_end; ++update) {
+      // Offset the first peer by sender rank to spread concurrent writes
+      // across receivers, visiting self last within the LSA team.
+      const int64_t peer = update / num_updates_per_replica;
+      const int64_t slot = update % num_updates_per_replica;
+      const int64_t rotated_peer =
+          (peer + world.rank - start_lsa + 1) % lsa_size;
+      const int64_t metadata_update =
+          rotated_peer * num_updates_per_replica + slot;
       RaggedAllToAllUpdateMetadata<kVectorSize> meta;
       if (!LoadRaggedAllToAllUpdateMetadata<kVectorSize>(
-              meta_base + update, num_updates_per_replica, num_row_elements,
-              input_buffer_offset_bytes, output_buffer_offset_bytes,
-              input_offsets_ptr, send_sizes_ptr, output_offsets_ptr, &meta)) {
+              meta_base + metadata_update, num_updates_per_replica,
+              num_row_elements, input_buffer_offset_bytes,
+              output_buffer_offset_bytes, input_offsets_ptr, send_sizes_ptr,
+              output_offsets_ptr, &meta)) {
         continue;
       }
       const int64_t update_end = update_begin + meta.byte_count / kVectorSize;
@@ -123,7 +132,7 @@ __device__ void RaggedAllToAllCopy(
         const int64_t hi =
             (cta_end < update_end ? cta_end : update_end) - update_begin;
         const int lsa_peer =
-            static_cast<int>(update / num_updates_per_replica);
+            static_cast<int>(metadata_update / num_updates_per_replica);
         const T* src = static_cast<const T*>(
             ncclGetLocalPointer(send_win, meta.src_byte_offset));
         T* dst = static_cast<T*>(
