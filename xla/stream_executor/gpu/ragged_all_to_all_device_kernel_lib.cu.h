@@ -135,11 +135,107 @@ __device__ __forceinline__ void RaggedAllToAllBulkCopy(const DeviceVec<16>* src,
   }
   __syncthreads();
 }
+
+// Prefetch two tiles per stream. All configurations use 32 KiB of buffers;
+// streams and tile size vary independently of the CTA's metadata threads.
+template <int kStreams, int kChunkBytes>
+__device__ __forceinline__ void RaggedAllToAllPipelinedBulkCopy(
+    const DeviceVec<16>* src, DeviceVec<16>* dst, int64_t lo, int64_t hi) {
+  constexpr int kStages = 2;
+  constexpr int kChunkElements = kChunkBytes / 16;
+  static_assert(kStreams * kStages * kChunkBytes == 32768);
+  __shared__ __align__(16) uint8_t buffers[kStreams][kStages][kChunkBytes];
+  __shared__ __align__(8) uint64_t barriers[kStreams][kStages];
+  const int warp = threadIdx.x / 32;
+  if (threadIdx.x % 32 == 0 && warp < kStreams) {
+    uint32_t buffer[kStages];
+    uint32_t barrier[kStages];
+    uint32_t phase[kStages] = {};
+#pragma unroll
+    for (int stage = 0; stage < kStages; ++stage) {
+      buffer[stage] =
+          static_cast<uint32_t>(__cvta_generic_to_shared(buffers[warp][stage]));
+      barrier[stage] = static_cast<uint32_t>(
+          __cvta_generic_to_shared(&barriers[warp][stage]));
+      asm volatile(
+          "mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(barrier[stage])
+          : "memory");
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+
+    const int64_t stride = kStreams * kChunkElements;
+    auto prefetch = [&](int stage, int64_t offset) {
+      if (offset >= hi) return;
+      const int64_t remaining = hi - offset;
+      const uint32_t bytes = static_cast<uint32_t>(
+          (remaining < kChunkElements ? remaining : kChunkElements) * 16);
+      asm volatile(
+          "{ .reg .b64 state; "
+          "mbarrier.arrive.expect_tx.shared::cta.b64 state, [%0], %1; }" ::"r"(
+              barrier[stage]),
+          "r"(bytes)
+          : "memory");
+      asm volatile(
+          "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+          "[%0], [%1], %2, [%3];" ::"r"(buffer[stage]),
+          "l"(src + offset), "r"(bytes), "r"(barrier[stage])
+          : "memory");
+    };
+    const int64_t begin = lo + warp * kChunkElements;
+#pragma unroll
+    for (int stage = 0; stage < kStages; ++stage) {
+      prefetch(stage, begin + stage * stride);
+    }
+    for (int64_t base = begin; base < hi; base += kStages * stride) {
+#pragma unroll
+      for (int stage = 0; stage < kStages; ++stage) {
+        const int64_t offset = base + stage * stride;
+        if (offset >= hi) break;
+        uint32_t complete;
+        do {
+          asm volatile(
+              "{ .reg .pred ready; "
+              "mbarrier.try_wait.parity.shared::cta.b64 ready, [%1], %2; "
+              "selp.u32 %0, 1, 0, ready; }"
+              : "=r"(complete)
+              : "r"(barrier[stage]), "r"(phase[stage])
+              : "memory");
+        } while (!complete);
+        phase[stage] ^= 1;
+        const int64_t remaining = hi - offset;
+        const uint32_t bytes = static_cast<uint32_t>(
+            (remaining < kChunkElements ? remaining : kChunkElements) * 16);
+        asm volatile(
+            "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(
+                dst + offset),
+            "r"(buffer[stage]), "r"(bytes)
+            : "memory");
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+        // Reuse this buffer only after the outgoing copy has read it. The next
+        // stage's source load can complete while this stage is being forwarded.
+        asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+        asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
+        prefetch(stage, offset + kStages * stride);
+      }
+    }
+    // No prefetch extends past hi, so consuming all tiles also drains every
+    // mbarrier transaction. Complete remote stores before the NCCL release.
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+#pragma unroll
+    for (int index = 0; index < kStages; ++index) {
+      asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(barrier[index])
+                   : "memory");
+    }
+  }
+  __syncthreads();
+}
 #endif  // __CUDA_ARCH__ >= 900
 
 // Policies: 0/1 use the original vector loop, 2/3 unroll four vectors, 4/5
-// unroll eight vectors, and 6/7 use bulk copies for 16-byte vectors. Odd
-// policies visit peers relative to the sender, self last.
+// unroll eight vectors, and 6/7 use bulk copies for 16-byte vectors. Policies
+// 8/9, 10/11, and 12/13 prefetch two tiles with 4/2/1 streams and 4/8/16 KiB
+// tiles, respectively. Odd policies visit peers relative to the sender, self
+// last.
 template <int64_t kVectorSize, int kCopyPolicy>
 __device__ void RaggedAllToAllCopy(
     ncclWindow_t send_win, ncclWindow_t recv_win,
@@ -211,7 +307,15 @@ __device__ void RaggedAllToAllCopy(
         if constexpr (kCopyPolicy >= 6 && kVectorSize == 16) {
           if ((reinterpret_cast<uintptr_t>(src) % 16 == 0) &&
               (reinterpret_cast<uintptr_t>(dst) % 16 == 0)) {
-            RaggedAllToAllBulkCopy(src, dst, lo, hi);
+            if constexpr (kCopyPolicy < 8) {
+              RaggedAllToAllBulkCopy(src, dst, lo, hi);
+            } else if constexpr (kCopyPolicy < 10) {
+              RaggedAllToAllPipelinedBulkCopy<4, 4096>(src, dst, lo, hi);
+            } else if constexpr (kCopyPolicy < 12) {
+              RaggedAllToAllPipelinedBulkCopy<2, 8192>(src, dst, lo, hi);
+            } else {
+              RaggedAllToAllPipelinedBulkCopy<1, 16384>(src, dst, lo, hi);
+            }
             update_begin = update_end;
             continue;
           }

@@ -273,7 +273,7 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     int policy = 0;
     CHECK(value == nullptr || absl::SimpleAtoi(value, &policy));
     CHECK_GE(policy, 0);
-    CHECK_LE(policy, 7);
+    CHECK_LE(policy, 13);
     return policy;
   }();
   if (copy_policy >= 6 && !executor->GetDeviceDescription()
@@ -325,6 +325,18 @@ absl::Status RunDeviceRaggedAllToAllKernel(
           return launch_policy(std::integral_constant<int, 6>{});
         case 7:
           return launch_policy(std::integral_constant<int, 7>{});
+        case 8:
+          return launch_policy(std::integral_constant<int, 8>{});
+        case 9:
+          return launch_policy(std::integral_constant<int, 9>{});
+        case 10:
+          return launch_policy(std::integral_constant<int, 10>{});
+        case 11:
+          return launch_policy(std::integral_constant<int, 11>{});
+        case 12:
+          return launch_policy(std::integral_constant<int, 12>{});
+        case 13:
+          return launch_policy(std::integral_constant<int, 13>{});
         default:
           return absl::InvalidArgumentError("Invalid RASM copy policy");
       }
