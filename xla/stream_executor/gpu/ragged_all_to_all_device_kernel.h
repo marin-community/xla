@@ -32,7 +32,7 @@ namespace stream_executor::gpu {
 
 // Must match the host launch width and the device kernel's launch bounds.
 // The launch grid is capped separately by RaggedAllToAllThunk.
-inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 256;
+inline constexpr int kRaggedAllToAllDeviceKernelThreadsPerCta = 512;
 
 template <int64_t kVectorSize>
 struct RaggedAllToAllDeviceKernel {
