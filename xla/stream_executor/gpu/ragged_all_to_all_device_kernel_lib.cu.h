@@ -18,6 +18,8 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "xla/stream_executor/gpu/ragged_all_to_all_device_kernel.h"
+
 #if NCCL_VERSION_CODE >= 22900
 #include "third_party/nccl/nccl_device.h"
 #endif
@@ -105,8 +107,8 @@ __device__ void RaggedAllToAllCopy(
     // Element offset of the current update within the concatenated element
     // space that cta_begin/cta_end index into.
     int64_t update_begin = 0;
-    for (int64_t update = 0;
-         update < num_lsa_updates && update_begin < cta_end; ++update) {
+    for (int64_t update = 0; update < num_lsa_updates && update_begin < cta_end;
+         ++update) {
       // Offset the first peer by sender rank to spread concurrent writes
       // across receivers, visiting self last within the LSA team.
       const int64_t peer = update / num_updates_per_replica;
@@ -187,14 +189,16 @@ __device__ void RaggedAllToAllCopy(
   }
 }
 
+// Match the launch width while leaving register allocation to the compiler.
 template <int64_t kVectorSize>
-__global__ void __launch_bounds__(512) RaggedAllToAllDeviceKernelImpl(
-    struct ncclDevComm dev_comm, ncclWindow_t send_win, ncclWindow_t recv_win,
-    const int64_t* __restrict__ input_offsets_ptr,
-    const int64_t* __restrict__ send_sizes_ptr,
-    const int64_t* __restrict__ output_offsets_ptr,
-    int64_t num_updates_per_replica, int64_t num_row_elements,
-    int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
+__global__ void __launch_bounds__(kRaggedAllToAllDeviceKernelThreadsPerCta)
+    RaggedAllToAllDeviceKernelImpl(
+        struct ncclDevComm dev_comm, ncclWindow_t send_win,
+        ncclWindow_t recv_win, const int64_t* __restrict__ input_offsets_ptr,
+        const int64_t* __restrict__ send_sizes_ptr,
+        const int64_t* __restrict__ output_offsets_ptr,
+        int64_t num_updates_per_replica, int64_t num_row_elements,
+        int64_t input_buffer_offset_bytes, int64_t output_buffer_offset_bytes) {
   // NCCL device barrier/GIN APIs emit scope-qualified atomics that require
   // sm_60+. Lower architectures compile to an empty stub; the kernel is only
   // launched when the device supports NCCL device comms.
