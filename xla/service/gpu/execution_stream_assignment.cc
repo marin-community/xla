@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <optional>
 #include <vector>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "xla/backends/gpu/runtime/execution_stream_id.h"
 #include "xla/backends/gpu/transforms/collectives/collective_domain.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -40,6 +42,9 @@ limitations under the License.
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/collective_opt_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
+#include "xla/layout.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/side_effect_util.h"
 
 namespace xla::gpu {
@@ -216,6 +221,60 @@ std::optional<CollectiveCommunicationDomain> FindCollectiveDomain(
   return *domain;
 }
 
+// Host-memory transfers (offloaded activations, optimizer state) run for
+// milliseconds on the host link. Round-robin assignment can queue a
+// microsecond device-to-device slice copy behind one of them on the same
+// stream, and the compute stream then waits for the slice. With
+// XLA_GPU_HOST_TRANSFER_STREAMS=1 each transfer direction gets one dedicated
+// stream past the round-robin pool, so slice copies never share a stream with
+// a host transfer.
+enum class HostTransfer { kNone, kToDevice, kToHost };
+
+bool DedicatedHostTransferStreams() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("XLA_GPU_HOST_TRANSFER_STREAMS");
+    return value != nullptr && absl::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+bool HasHostMemorySpace(const Shape& shape) {
+  bool host = false;
+  ShapeUtil::ForEachSubshape(shape, [&](const Shape& subshape,
+                                        const ShapeIndex& /*index*/) {
+    if (subshape.IsArray() && subshape.has_layout() &&
+        subshape.layout().memory_space() == Layout::kHostMemorySpace) {
+      host = true;
+    }
+  });
+  return host;
+}
+
+HostTransfer ClassifyHostTransfer(const HloInstruction* hlo) {
+  const HloInstruction* op = hlo;
+  if (auto* start = DynCast<HloAsyncStartInstruction>(hlo)) {
+    op = start->async_wrapped_instruction();
+  } else if (hlo->opcode() == HloOpcode::kCopyStart) {
+    // copy-start returns (destination, source, context).
+    if (HasHostMemorySpace(hlo->shape().tuple_shapes(0))) {
+      return HostTransfer::kToHost;
+    }
+    return HasHostMemorySpace(hlo->operand(0)->shape()) ? HostTransfer::kToDevice
+                                                        : HostTransfer::kNone;
+  } else {
+    return HostTransfer::kNone;
+  }
+  if (HasHostMemorySpace(op->shape())) {
+    return HostTransfer::kToHost;
+  }
+  for (const HloInstruction* operand : op->operands()) {
+    if (HasHostMemorySpace(operand->shape())) {
+      return HostTransfer::kToDevice;
+    }
+  }
+  return HostTransfer::kNone;
+}
+
 }  // namespace
 
 ExecutionStreamAssignment::ExecutionStreamAssignment(const HloModule* module,
@@ -253,6 +312,21 @@ ExecutionStreamAssignment::ExecutionStreamAssignment(const HloModule* module,
               FindCollectiveDomain(hlo, *kind);
           if (collective_domain.has_value()) {
             stream_id = execution_streams.NextCollective(*collective_domain);
+          }
+        }
+        if (!stream_id.has_value() && *kind == ExecutionScopeKind::kCompute &&
+            DedicatedHostTransferStreams()) {
+          switch (ClassifyHostTransfer(hlo)) {
+            case HostTransfer::kToDevice:
+              stream_id = ExecutionStreamId(ComputationStreamId(
+                  options.number_of_compute_execution_streams));
+              break;
+            case HostTransfer::kToHost:
+              stream_id = ExecutionStreamId(ComputationStreamId(
+                  options.number_of_compute_execution_streams + 1));
+              break;
+            case HostTransfer::kNone:
+              break;
           }
         }
         if (!stream_id.has_value() && IsPipelinedP2P(hlo) &&
