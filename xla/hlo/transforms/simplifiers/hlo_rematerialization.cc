@@ -1441,6 +1441,17 @@ std::optional<int64_t> MemoryUsageTracker::GetCostOfHostOffload(
     return {};
   }
 
+  // An indirect use reads the buffer through an alias, such as the done of an
+  // async collective whose start took the buffer as an operand.
+  // OffloadInstruction moves only direct users onto the reloaded copy, so when
+  // every direct user is already placed it has nowhere to put the reload.
+  // Recomputation skips these buffers too; see MemoryReducedIfRematerialized.
+  if (output_buffer.has_indirect_uses) {
+    VLOG(2) << "  " << candidate_instruction->name()
+            << " has indirect uses; cannot offload to host.";
+    return {};
+  }
+
   // If the current instruction uses this buffer, it doesn't make sense to
   // offload.
   const bool current_instruction_uses_this_item = [&]() {
