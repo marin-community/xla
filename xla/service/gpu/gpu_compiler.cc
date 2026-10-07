@@ -3261,9 +3261,14 @@ HloRematerialization::Options CreateRematOpts(
             /*bandwidth_from_host_bytes_per_second=*/
             gpu_device_info.memory_bandwidth());
   }
+  // Marin fork: host memory offloading keeps the accounting above, which counts
+  // host-space buffers as free, but rematerialization never offloads values to
+  // meet its limit. That strategy prices host copies at device memory
+  // bandwidth, more than ten times the host link on GB200, and its copies
+  // share memcpy streams with the program's own host offload.
   HloRematerialization::RematerializationModeConfig
       rematerialization_mode_config(/*recompute=*/true, /*compress=*/true,
-                                    /*host_offload=*/enable_offloading);
+                                    /*host_offload=*/false);
   HloRematerialization::Options options(
       hlo_cost_analysis, rematerialization_mode_config,
       // Assume 75% of the total device memory is available for XLA.
